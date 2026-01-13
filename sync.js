@@ -17,6 +17,7 @@ function lerValor(campo) {
 function lerTexto(campo) {
     if (!campo) return '';
     if (typeof campo === 'object') {
+        // Se for CDATA ou texto normal dentro de objeto
         return campo['#text'] || '';
     }
     return String(campo);
@@ -30,7 +31,7 @@ function lerFeatures(featuresNode) {
 }
 
 async function runImport() {
-    console.log(`[${new Date().toISOString()}] Iniciando Importação V6 (Hard Reset & Sanity Check)...`);
+    console.log(`[${new Date().toISOString()}] Iniciando Importação V7 (Capa Fix + Título)...`);
     let stats = { total: 0, processados: 0, erros: 0 };
 
     try {
@@ -38,9 +39,18 @@ async function runImport() {
         const response = await axios.get(XML_URL, { responseType: 'text' });
         
         console.log('2. Parseando...');
-        const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
+        // ignoreAttributes: false é crucial para ler primary="true"
+        const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
         const jsonData = parser.parse(response.data);
-        const listings = jsonData['ListingDataFeed']['Listings']['Listing'];
+        
+        // Verifica estrutura para evitar crash se vier vazio
+        if (!jsonData['ListingDataFeed'] || !jsonData['ListingDataFeed']['Listings']) {
+            throw new Error("Estrutura do XML inválida ou vazia.");
+        }
+
+        const listingsRaw = jsonData['ListingDataFeed']['Listings']['Listing'];
+        const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
+        
         stats.total = listings.length;
 
         const BATCH_SIZE = 50;
@@ -52,51 +62,67 @@ async function runImport() {
                 try {
                     const details = item.Details || {};
                     const location = item.Location || {};
-                    const transacao = lerTexto(item.TransactionType); // "For Sale" ou "For Rent"
+                    const transacao = lerTexto(item.TransactionType); 
                     const tipoImovel = lerTexto(details.PropertyType);
 
-                    // --- LÓGICA RÍGIDA DE PREÇOS ---
+                    // --- TRATAMENTO DE PREÇOS ---
                     let vVenda = 0;
                     let vAluguel = 0;
-                    
                     const rawListPrice = lerValor(details.ListPrice);
                     const rawRentalPrice = lerValor(details.RentalPrice);
 
                     if (transacao === 'For Rent') {
-                        // Se é aluguel, SÓ aceita aluguel. Venda vira 0.
                         vAluguel = rawRentalPrice > 0 ? rawRentalPrice : rawListPrice;
-                        vVenda = 0; 
                     } else if (transacao === 'For Sale') {
-                        // Se é venda, SÓ aceita venda. Aluguel vira 0.
                         vVenda = rawListPrice;
-                        vAluguel = 0;
                     } else {
-                        // Se for "Sale/Rent" (venda e aluguel), tenta pegar os dois
                         vVenda = rawListPrice;
                         vAluguel = rawRentalPrice;
                     }
 
-                    // --- SANITY CHECK (Evitar 43 banheiros) ---
-                    let banheiros = parseInt(lerValor(details.Bathrooms)) || 0;
-                    let vagas = parseInt(lerValor(details.Garage)) || 0;
-                    
-                    // Se for apartamento/casa residencial e tiver valores absurdos, limita
-                    const isResidencial = tipoImovel.includes('Residential') || tipoImovel.includes('Apartment') || tipoImovel.includes('Home');
-                    
-                    if (isResidencial) {
-                        if (banheiros > 10) banheiros = 10; // Cap de segurança
-                        if (vagas > 20) vagas = 20; // Cap de segurança
-                    }
-
-                    // Fotos
+                    // --- TRATAMENTO DE FOTOS (Capa Fix) ---
                     let mediaItems = [];
                     if (item.Media && item.Media.Item) {
                         mediaItems = Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item];
                     }
-                    const fotos = mediaItems.map(m => lerTexto(m)).filter(f => f.length > 0 && f.startsWith('http'));
+
+                    let listaFotos = [];
+                    let fotoCapa = null;
+
+                    mediaItems.forEach(m => {
+                        const url = lerTexto(m);
+                        if (url && url.length > 0 && url.startsWith('http')) {
+                            // Verifica atributo primary="true"
+                            // Configurei o prefixo como @_ no parser para evitar confusão
+                            const isPrimary = (m['@_primary'] === 'true' || m['@_primary'] === true);
+                            
+                            if (isPrimary) {
+                                fotoCapa = url;
+                            } else {
+                                listaFotos.push(url);
+                            }
+                        }
+                    });
+
+                    // Se encontrou capa, coloca ela no índice 0 (início do array)
+                    if (fotoCapa) {
+                        listaFotos.unshift(fotoCapa);
+                    } else {
+                        // Se não tem primary definido, o primeiro item continua sendo o primeiro da lista
+                    }
+
+                    // --- INFORMAÇÕES SANITIZADAS ---
+                    let banheiros = parseInt(lerValor(details.Bathrooms)) || 0;
+                    let vagas = parseInt(lerValor(details.Garage)) || 0;
+                    const isResidencial = tipoImovel.includes('Residential');
+                    if (isResidencial) {
+                        if (banheiros > 10) banheiros = 10;
+                        if (vagas > 20) vagas = 20;
+                    }
 
                     upsertData.push({
                         listing_id: lerTexto(item.ListingID),
+                        titulo: lerTexto(item.Title), // NOVO CAMPO
                         tipo: tipoImovel,
                         finalidade: transacao,
                         status: 'ativo',
@@ -106,8 +132,8 @@ async function runImport() {
                         
                         quartos: parseInt(lerValor(details.Bedrooms)) || 0,
                         suites: parseInt(lerValor(details.Suites)) || 0,
-                        banheiros: banheiros, // Valor sanitizado
-                        vagas_garagem: vagas, // Valor sanitizado
+                        banheiros: banheiros,
+                        vagas_garagem: vagas,
                         area_total: lerValor(details.LotArea),
                         area_util: lerValor(details.LivingArea),
                         
@@ -118,7 +144,7 @@ async function runImport() {
                         
                         descricao: lerTexto(details.Description),
                         diferenciais: lerFeatures(details.Features),
-                        fotos_urls: fotos,
+                        fotos_urls: listaFotos, // Array ordenado com capa em [0]
                         
                         seen_today: true,
                         last_sync: new Date(),
@@ -138,13 +164,13 @@ async function runImport() {
                 if (!error) {
                     stats.processados += upsertData.length;
                 } else {
-                    console.error('Erro lote:', error.message);
+                    console.error('Erro lote Supabase:', error.message);
                 }
             }
             if (i % 500 === 0) console.log(`Progresso: ${i}/${stats.total}...`);
         }
         
-        console.log('✅ Importação V6 Finalizada! Dados limpos e segregados.');
+        console.log('✅ Importação Finalizada com Sucesso!');
 
     } catch (error) {
         console.error('❌ Erro Fatal:', error.message);
