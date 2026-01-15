@@ -1,19 +1,15 @@
 {
   "name": "importador-imoveis",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Script de importação XML para Supabase",
+  "main": "sync.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node sync.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "@supabase/supabase-js": "^2.90.1",
-    "axios": "^1.13.2",
-    "dotenv": "^17.2.3",
-    "fast-xml-parser": "^5.3.3"
+    "@supabase/supabase-js": "^2.39.0",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "fast-xml-parser": "^4.3.2"
   }
 }
