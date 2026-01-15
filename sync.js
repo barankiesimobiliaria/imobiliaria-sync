@@ -26,10 +26,22 @@ function lerFeatures(featuresNode) {
 }
 
 async function runImport() {
-    console.log(`[${new Date().toISOString()}] Iniciando Importação V9 (ÚNICO + Seguro)...`);
-    let stats = { total: 0, novos: 0, atualizados: 0, erros: 0, ignorados: 0 };
+    console.log(`[${new Date().toISOString()}] Iniciando Importação V10 (Com Limpeza e Endereço)...`);
+    let stats = { total: 0, processados: 0, erros: 0, ignorados: 0, desativados: 0 };
 
     try {
+        // --- PASSO 0: RESETAR A FLAG DO DIA ---
+        // Marcamos tudo como "não visto hoje" (false). 
+        // Quem continuar false no final, significa que não veio no XML e será desativado.
+        console.log('0. Resetando flags de sincronização...');
+        const { error: resetError } = await supabase
+            .from('cache_xml_externo')
+            .update({ seen_today: false })
+            .neq('id', 0); // Atualiza todos (segurança: neq id 0 pega tudo)
+            
+        if (resetError) throw new Error(`Erro ao resetar flags: ${resetError.message}`);
+
+        // --- PASSO 1: BAIXAR XML ---
         console.log('1. Baixando XML...');
         const response = await axios.get(XML_URL, { responseType: 'text' });
         
@@ -46,6 +58,7 @@ async function runImport() {
         stats.total = listings.length;
         console.log(`📊 Total imóveis no XML: ${stats.total}`);
 
+        // --- PASSO 2: PROCESSAR LOTES ---
         const BATCH_SIZE = 50;
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
@@ -54,7 +67,6 @@ async function runImport() {
             for (const item of batch) {
                 const listing_id = lerTexto(item.ListingID)?.trim();
                 
-                // ✅ VALIDAÇÃO RIGOROSA: pula inválidos
                 if (!listing_id || listing_id.length === 0) {
                     stats.ignorados++;
                     continue;
@@ -66,7 +78,7 @@ async function runImport() {
                     const transacao = lerTexto(item.TransactionType); 
                     const tipoImovel = lerTexto(details.PropertyType);
 
-                    // TRATAMENTO DE PREÇOS
+                    // PREÇOS
                     let vVenda = 0, vAluguel = 0;
                     const rawListPrice = lerValor(details.ListPrice);
                     const rawRentalPrice = lerValor(details.RentalPrice);
@@ -75,7 +87,7 @@ async function runImport() {
                     else if (transacao === 'For Sale') vVenda = rawListPrice;
                     else { vVenda = rawListPrice; vAluguel = rawRentalPrice; }
 
-                    // TRATAMENTO DE FOTOS
+                    // FOTOS
                     let mediaItems = [];
                     if (item.Media && item.Media.Item) {
                         mediaItems = Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item];
@@ -96,7 +108,7 @@ async function runImport() {
                     const lat = location.Latitude ? lerTexto(location.Latitude) : null;
                     const lon = location.Longitude ? lerTexto(location.Longitude) : null;
 
-                    // SANITIZAÇÃO
+                    // LIMITES (Banheiros/Vagas)
                     let banheiros = parseInt(lerValor(details.Bathrooms)) || 0;
                     let vagas = parseInt(lerValor(details.Garage)) || 0;
                     const isResidencial = tipoImovel.includes('Residential');
@@ -110,7 +122,10 @@ async function runImport() {
                         titulo: lerTexto(item.Title),
                         tipo: tipoImovel,
                         finalidade: transacao,
-                        status: 'ativo',
+                        status: 'ativo', // Forçamos ativo pois veio no XML de hoje
+                        
+                        // CORREÇÃO: ADICIONANDO ENDEREÇO (RUA)
+                        endereco: lerTexto(location.Address), // <--- AQUI ESTÁ A CORREÇÃO
                         cidade: location.City ? lerTexto(location.City).toUpperCase() : null,
                         bairro: lerTexto(location.Neighborhood),
                         uf: lerTexto(location.State) || 'PR',
@@ -134,7 +149,7 @@ async function runImport() {
                         diferenciais: lerFeatures(details.Features),
                         fotos_urls: listaFotos,
                         
-                        seen_today: true,
+                        seen_today: true, // Marca que vimos hoje
                         last_sync: new Date(),
                         xml_provider: 'RedeUrbana'
                     });
@@ -150,7 +165,7 @@ async function runImport() {
                     .from('cache_xml_externo')
                     .upsert(upsertData, { 
                         onConflict: 'listing_id',
-                        ignoreDuplicates: true  // ✅ Backup se constraint falhar
+                        ignoreDuplicates: false // ✅ CORREÇÃO: False para PERMITIR ATUALIZAÇÃO de preços e dados
                     });
 
                 if (error) {
@@ -158,25 +173,35 @@ async function runImport() {
                     stats.erros += upsertData.length;
                 } else {
                     stats.processados += upsertData.length;
-                    console.log(`✅ Lote ${Math.floor(i/BATCH_SIZE)+1}: ${upsertData.length} processados`);
                 }
             }
             
             if (i % 500 === 0) console.log(`📈 Progresso: ${i}/${stats.total}`);
         }
 
-        // ✅ VERIFICAÇÃO FINAL
-        const { count } = await supabase
-            .from('cache_xml_externo')
-            .select('*', { count: 'exact', head: true })
-            .eq('seen_today', true);
+        // --- PASSO 3: LIMPEZA (DESATIVAR O QUE NÃO VEIO) ---
+        console.log('3. Desativando imóveis removidos do XML...');
         
-        console.log('🎉 Importação V9 Finalizada!');
-        console.log(`📊 Stats: Total=${stats.total}, Processados=${stats.processados}, Novos/Atualizados estimados=${count || 0}, Erros=${stats.erros}, Ignorados=${stats.ignorados}`);
+        // Se seen_today for false, é porque estava no banco mas NÃO veio no XML de hoje
+        const { data: desativados, error: deleteError } = await supabase
+            .from('cache_xml_externo')
+            .update({ status: 'inativo' }) 
+            .eq('seen_today', false)
+            .neq('status', 'inativo') // Só conta se já não estava inativo
+            .select();
+
+        if (deleteError) {
+            console.error("Erro na limpeza:", deleteError.message);
+        } else {
+            stats.desativados = desativados.length;
+            console.log(`🗑️ Imóveis desativados/removidos: ${stats.desativados}`);
+        }
+        
+        console.log('🎉 Importação V10 Finalizada!');
+        console.log(`📊 RESUMO: Total XML=${stats.total}, Atualizados=${stats.processados}, Removidos=${stats.desativados}, Erros=${stats.erros}`);
         
     } catch (error) { 
         console.error('💥 Erro Fatal:', error.message); 
-        stats.erros = stats.total;
     }
 }
 
