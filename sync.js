@@ -26,8 +26,8 @@ function lerFeatures(featuresNode) {
 }
 
 async function runImport() {
-    console.log(`[${new Date().toISOString()}] Iniciando Importação V8 (Coords + Capa + Titulo)...`);
-    let stats = { total: 0, processados: 0, erros: 0 };
+    console.log(`[${new Date().toISOString()}] Iniciando Importação V9 (ÚNICO + Seguro)...`);
+    let stats = { total: 0, novos: 0, atualizados: 0, erros: 0, ignorados: 0 };
 
     try {
         console.log('1. Baixando XML...');
@@ -44,6 +44,7 @@ async function runImport() {
         const listingsRaw = jsonData['ListingDataFeed']['Listings']['Listing'];
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.total = listings.length;
+        console.log(`📊 Total imóveis no XML: ${stats.total}`);
 
         const BATCH_SIZE = 50;
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
@@ -51,13 +52,21 @@ async function runImport() {
             const upsertData = [];
 
             for (const item of batch) {
+                const listing_id = lerTexto(item.ListingID)?.trim();
+                
+                // ✅ VALIDAÇÃO RIGOROSA: pula inválidos
+                if (!listing_id || listing_id.length === 0) {
+                    stats.ignorados++;
+                    continue;
+                }
+
                 try {
                     const details = item.Details || {};
                     const location = item.Location || {};
                     const transacao = lerTexto(item.TransactionType); 
                     const tipoImovel = lerTexto(details.PropertyType);
 
-                    // --- TRATAMENTO DE PREÇOS ---
+                    // TRATAMENTO DE PREÇOS
                     let vVenda = 0, vAluguel = 0;
                     const rawListPrice = lerValor(details.ListPrice);
                     const rawRentalPrice = lerValor(details.RentalPrice);
@@ -66,7 +75,7 @@ async function runImport() {
                     else if (transacao === 'For Sale') vVenda = rawListPrice;
                     else { vVenda = rawListPrice; vAluguel = rawRentalPrice; }
 
-                    // --- TRATAMENTO DE FOTOS ---
+                    // TRATAMENTO DE FOTOS
                     let mediaItems = [];
                     if (item.Media && item.Media.Item) {
                         mediaItems = Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item];
@@ -83,11 +92,11 @@ async function runImport() {
                     });
                     if (fotoCapa) listaFotos.unshift(fotoCapa);
 
-                    // --- NOVO: Captura de Coordenadas ---
+                    // COORDENADAS
                     const lat = location.Latitude ? lerTexto(location.Latitude) : null;
                     const lon = location.Longitude ? lerTexto(location.Longitude) : null;
 
-                    // --- INFORMAÇÕES SANITIZADAS ---
+                    // SANITIZAÇÃO
                     let banheiros = parseInt(lerValor(details.Bathrooms)) || 0;
                     let vagas = parseInt(lerValor(details.Garage)) || 0;
                     const isResidencial = tipoImovel.includes('Residential');
@@ -97,7 +106,7 @@ async function runImport() {
                     }
 
                     upsertData.push({
-                        listing_id: lerTexto(item.ListingID),
+                        listing_id: listing_id,
                         titulo: lerTexto(item.Title),
                         tipo: tipoImovel,
                         finalidade: transacao,
@@ -106,7 +115,6 @@ async function runImport() {
                         bairro: lerTexto(location.Neighborhood),
                         uf: lerTexto(location.State) || 'PR',
                         
-                        // NOVOS CAMPOS AQUI
                         latitude: lat,
                         longitude: lon,
                         
@@ -132,21 +140,44 @@ async function runImport() {
                     });
 
                 } catch (e) {
-                    console.error(`Erro item ${item.ListingID}:`, e.message);
+                    console.error(`❌ Erro item ${listing_id}:`, e.message);
+                    stats.erros++;
                 }
             }
 
             if (upsertData.length > 0) {
-                const { error } = await supabase.from('cache_xml_externo').upsert(upsertData, { 
-                    onConflict: 'listing_id' 
-                });
-                if (!error) stats.processados += upsertData.length;
-                else console.error('Erro lote Supabase:', error.message);
+                const { data, error } = await supabase
+                    .from('cache_xml_externo')
+                    .upsert(upsertData, { 
+                        onConflict: 'listing_id',
+                        ignoreDuplicates: true  // ✅ Backup se constraint falhar
+                    });
+
+                if (error) {
+                    console.error('❌ Erro lote Supabase:', error.message);
+                    stats.erros += upsertData.length;
+                } else {
+                    stats.processados += upsertData.length;
+                    console.log(`✅ Lote ${Math.floor(i/BATCH_SIZE)+1}: ${upsertData.length} processados`);
+                }
             }
-            if (i % 500 === 0) console.log(`Progresso: ${i}/${stats.total}...`);
+            
+            if (i % 500 === 0) console.log(`📈 Progresso: ${i}/${stats.total}`);
         }
-        console.log('✅ Importação V8 Finalizada com Sucesso!');
-    } catch (error) { console.error('❌ Erro Fatal:', error.message); }
+
+        // ✅ VERIFICAÇÃO FINAL
+        const { count } = await supabase
+            .from('cache_xml_externo')
+            .select('*', { count: 'exact', head: true })
+            .eq('seen_today', true);
+        
+        console.log('🎉 Importação V9 Finalizada!');
+        console.log(`📊 Stats: Total=${stats.total}, Processados=${stats.processados}, Novos/Atualizados estimados=${count || 0}, Erros=${stats.erros}, Ignorados=${stats.ignorados}`);
+        
+    } catch (error) { 
+        console.error('💥 Erro Fatal:', error.message); 
+        stats.erros = stats.total;
+    }
 }
 
 runImport();
