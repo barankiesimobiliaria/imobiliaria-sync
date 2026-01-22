@@ -7,7 +7,7 @@ const XML_URL = 'https://redeurbana.com.br/imoveis/rede/2e2b5834-643b-49c1-8289-
 const PROVIDER_NAME = 'RedeUrbana';
 const BATCH_SIZE = 50;
 
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY ) {
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
     console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas.");
     process.exit(1);
 }
@@ -36,11 +36,50 @@ function lerFeatures(featuresNode) {
     return lista.map(f => lerTexto(f)).filter(f => f !== '');
 }
 
+// Função para registrar o log de importação
+async function registrarLog(stats) {
+    try {
+        const { error } = await supabase.from('import_logs').insert({
+            data_execucao: new Date().toISOString(),
+            status: stats.erro ? 'erro' : 'sucesso',
+            total_xml: stats.totalXml,
+            novos: stats.novos,
+            atualizados: stats.atualizados,
+            removidos: stats.desativados,
+            mensagem_erro: stats.mensagemErro || null
+        });
+        
+        if (error) {
+            console.error('⚠️ Erro ao salvar log:', error.message);
+        } else {
+            console.log('📝 Log de importação registrado com sucesso!');
+        }
+    } catch (err) {
+        console.error('⚠️ Falha ao registrar log:', err.message);
+    }
+}
+
 async function runImport() {
     console.log(`🚀 Iniciando Sincronização...`);
-    let stats = { totalXml: 0, processados: 0, erros: 0, desativados: 0 };
+    let stats = { 
+        totalXml: 0, 
+        novos: 0, 
+        atualizados: 0, 
+        desativados: 0, 
+        erros: 0,
+        erro: false,
+        mensagemErro: null
+    };
 
     try {
+        // Pegar IDs existentes para saber quais são novos
+        const { data: existentes } = await supabase
+            .from('cache_xml_externo')
+            .select('listing_id')
+            .eq('xml_provider', PROVIDER_NAME);
+        
+        const idsExistentes = new Set((existentes || []).map(e => e.listing_id));
+
         console.log(`0. Resetando flags para: ${PROVIDER_NAME}`);
         await supabase.from('cache_xml_externo').update({ seen_today: false }).eq('xml_provider', PROVIDER_NAME);
 
@@ -55,6 +94,7 @@ async function runImport() {
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
 
+        console.log('2. Processando imóveis...');
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
             const upsertData = batch.map(item => {
@@ -77,12 +117,17 @@ async function runImport() {
                 let capa = null;
                 mediaItems.forEach(m => {
                     const url = lerTexto(m);
-                    if (url.startsWith('http' )) {
+                    if (url.startsWith('http')) {
                         if ((m['@_primary'] === 'true' || m['@_primary'] === true) && !capa) capa = url;
                         else fotos.push(url);
                     }
                 });
                 if (capa) fotos.unshift(capa);
+
+                // Verificar se é novo ou atualização
+                const isNovo = !idsExistentes.has(listing_id);
+                if (isNovo) stats.novos++;
+                else stats.atualizados++;
 
                 return {
                     listing_id,
@@ -117,9 +162,14 @@ async function runImport() {
 
             if (upsertData.length > 0) {
                 const { error } = await supabase.from('cache_xml_externo').upsert(upsertData, { onConflict: 'listing_id' });
-                if (error) stats.erros += upsertData.length;
-                else stats.processados += upsertData.length;
+                if (error) {
+                    stats.erros += upsertData.length;
+                    console.error('Erro no batch:', error.message);
+                }
             }
+            
+            // Progresso
+            console.log(`   Processado: ${Math.min(i + BATCH_SIZE, listings.length)}/${listings.length}`);
         }
 
         console.log('3. Inativando removidos...');
@@ -129,10 +179,26 @@ async function runImport() {
             .select();
         
         stats.desativados = desat ? desat.length : 0;
-        console.log(`✅ Sucesso! XML: ${stats.totalXml} | Ativos: ${stats.processados} | Inativados: ${stats.desativados}`);
+        
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log(`✅ SINCRONIZAÇÃO CONCLUÍDA!`);
+        console.log(`   📊 Total no XML: ${stats.totalXml}`);
+        console.log(`   🆕 Novos: ${stats.novos}`);
+        console.log(`   🔄 Atualizados: ${stats.atualizados}`);
+        console.log(`   ❌ Desativados: ${stats.desativados}`);
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+        // Registrar log de sucesso
+        await registrarLog(stats);
 
     } catch (error) {
         console.error('💥 Erro Fatal:', error.message);
+        stats.erro = true;
+        stats.mensagemErro = error.message;
+        
+        // Registrar log de erro
+        await registrarLog(stats);
+        
         process.exit(1);
     }
 }
