@@ -17,10 +17,6 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// ============================================
-// FUNÇÕES AUXILIARES
-// ============================================
-
 function lerValor(campo) {
     if (campo === undefined || campo === null) return 0;
     if (typeof campo === 'object') return campo['#text'] ? parseFloat(campo['#text']) : 0;
@@ -41,7 +37,6 @@ function lerFeatures(featuresNode) {
     return lista.map(f => lerTexto(f)).filter(f => f !== '');
 }
 
-// Gera hash MD5 dos dados principais
 function gerarHash(d) {
     const str = [
         d.titulo || '',
@@ -66,7 +61,6 @@ function gerarHash(d) {
     return crypto.createHash('md5').update(str).digest('hex');
 }
 
-// Busca TODOS os listing_id e hash existentes (com paginação)
 async function buscarHashesExistentes() {
     console.log('   Buscando hashes existentes...');
     const mapa = new Map();
@@ -87,22 +81,19 @@ async function buscarHashesExistentes() {
             break;
         }
         
-        if (!data || data.length === 0) {
-            console.log(`   Fim da busca no offset ${offset}`);
-            break;
-        }
+        if (!data || data.length === 0) break;
         
         data.forEach(item => {
             mapa.set(item.listing_id, item.data_hash || '');
         });
         
         totalBuscado += data.length;
-        console.log(`   ... buscados ${totalBuscado} registros`);
         
         if (data.length < limite) break;
         offset += limite;
     }
     
+    console.log(`   ✅ ${totalBuscado} registros encontrados`);
     return mapa;
 }
 
@@ -124,14 +115,10 @@ async function registrarLog(stats) {
     }
 }
 
-// ============================================
-// FUNÇÃO PRINCIPAL
-// ============================================
-
 async function runImport() {
     console.log('');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('🚀 SINCRONIZAÇÃO XML - v3.0');
+    console.log('🚀 SINCRONIZAÇÃO XML - v3.1');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     
     let stats = { 
@@ -154,13 +141,11 @@ async function runImport() {
         // PASSO 2: Resetar flags
         console.log('');
         console.log('🔄 Passo 2: Resetando flags...');
-        const { error: errReset } = await supabase
+        await supabase
             .from('cache_xml_externo')
             .update({ seen_today: false })
             .eq('xml_provider', PROVIDER_NAME);
-        
-        if (errReset) console.warn('   ⚠️ Aviso reset:', errReset.message);
-        else console.log('   ✅ Flags resetadas');
+        console.log('   ✅ Flags resetadas');
 
         // PASSO 3: Baixar XML
         console.log('');
@@ -188,6 +173,7 @@ async function runImport() {
         console.log('⚙️ Passo 4: Processando...');
         
         const idsProcessados = new Set();
+        const agora = new Date().toISOString();
         
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
@@ -251,32 +237,32 @@ async function runImport() {
                     diferenciais: lerFeatures(details.Features),
                     fotos_urls: fotos,
                     seen_today: true,
-                    last_sync: new Date().toISOString(),
+                    last_sync: agora,
                     xml_provider: PROVIDER_NAME
                 };
 
-                // Calcular hash dos dados novos
                 const hashNovo = gerarHash(dadosImovel);
                 dadosImovel.data_hash = hashNovo;
 
-                // Verificar se existe e se mudou
                 const hashAntigo = hashesExistentes.get(listing_id);
                 
                 if (hashAntigo === undefined) {
-                    // NOVO - não existe no banco
+                    // NOVO
                     stats.novos++;
+                    dadosImovel.data_ultima_alteracao = agora; // Data de criação = data de alteração
                     upsertData.push(dadosImovel);
                 } else if (hashAntigo !== hashNovo) {
-                    // ATUALIZADO - hash diferente
+                    // ATUALIZADO - hash diferente, houve mudança real
                     stats.atualizados++;
+                    dadosImovel.data_ultima_alteracao = agora; // Atualiza data de alteração
                     upsertData.push(dadosImovel);
                 } else {
-                    // SEM ALTERAÇÃO - só atualiza flags
+                    // SEM ALTERAÇÃO - só atualiza flags (NÃO atualiza data_ultima_alteracao)
                     stats.semAlteracao++;
                     upsertData.push({
                         listing_id,
                         seen_today: true,
-                        last_sync: new Date().toISOString(),
+                        last_sync: agora,
                         status: 'ativo'
                     });
                 }
@@ -325,20 +311,11 @@ async function runImport() {
         console.log(`   ✨ Sem alteração:   ${stats.semAlteracao}`);
         console.log(`   ❌ Removidos:       ${stats.desativados}`);
         console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-        
-        // Validação
-        const totalProcessado = stats.novos + stats.atualizados + stats.semAlteracao;
-        console.log(`   🔍 Validação: ${totalProcessado}/${stats.totalXml}`);
-        
-        if (totalProcessado !== stats.totalXml) {
-            console.warn(`   ⚠️ DIFERENÇA DE ${stats.totalXml - totalProcessado} IMÓVEIS!`);
-        }
 
         await registrarLog(stats);
 
     } catch (error) {
-        console.error('');
-        console.error('💥 ERRO FATAL:', error.message);
+        console.error('💥 ERRO:', error.message);
         stats.erro = true;
         stats.mensagemErro = error.message;
         await registrarLog(stats);
