@@ -17,6 +17,10 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
+// ============================================
+// FUNÇÕES AUXILIARES
+// ============================================
+
 function lerValor(campo) {
     if (campo === undefined || campo === null) return 0;
     if (typeof campo === 'object') return campo['#text'] ? parseFloat(campo['#text']) : 0;
@@ -37,182 +41,151 @@ function lerFeatures(featuresNode) {
     return lista.map(f => lerTexto(f)).filter(f => f !== '');
 }
 
-function normalizarParaHash(valor) {
-    if (valor === null || valor === undefined) return '';
-    if (typeof valor === 'number') return valor.toString();
-    if (typeof valor === 'string') return valor.trim();
-    if (Array.isArray(valor)) return JSON.stringify(valor.sort());
-    return String(valor);
+// Gera hash MD5 dos dados principais
+function gerarHash(d) {
+    const str = [
+        d.titulo || '',
+        d.tipo || '',
+        d.finalidade || '',
+        d.cidade || '',
+        d.bairro || '',
+        d.endereco || '',
+        String(d.quartos || 0),
+        String(d.suites || 0),
+        String(d.banheiros || 0),
+        String(d.vagas_garagem || 0),
+        String(d.area_total || 0),
+        String(d.area_util || 0),
+        String(d.valor_venda || 0),
+        String(d.valor_aluguel || 0),
+        String(d.valor_condominio || 0),
+        d.descricao || '',
+        JSON.stringify(d.fotos_urls || [])
+    ].join('|');
+    
+    return crypto.createHash('md5').update(str).digest('hex');
 }
 
-function gerarHash(dados) {
-    const obj = {
-        titulo: normalizarParaHash(dados.titulo),
-        tipo: normalizarParaHash(dados.tipo),
-        finalidade: normalizarParaHash(dados.finalidade),
-        endereco: normalizarParaHash(dados.endereco),
-        cidade: normalizarParaHash(dados.cidade),
-        bairro: normalizarParaHash(dados.bairro),
-        quartos: normalizarParaHash(dados.quartos),
-        suites: normalizarParaHash(dados.suites),
-        banheiros: normalizarParaHash(dados.banheiros),
-        vagas_garagem: normalizarParaHash(dados.vagas_garagem),
-        area_total: normalizarParaHash(parseFloat(dados.area_total) || 0),
-        area_util: normalizarParaHash(parseFloat(dados.area_util) || 0),
-        valor_venda: normalizarParaHash(parseFloat(dados.valor_venda) || 0),
-        valor_aluguel: normalizarParaHash(parseFloat(dados.valor_aluguel) || 0),
-        valor_condominio: normalizarParaHash(parseFloat(dados.valor_condominio) || 0),
-        descricao: normalizarParaHash(dados.descricao),
-        fotos: normalizarParaHash(dados.fotos_urls || [])
-    };
-    return crypto.createHash('md5').update(JSON.stringify(obj)).digest('hex');
+// Busca TODOS os listing_id e hash existentes (com paginação)
+async function buscarHashesExistentes() {
+    console.log('   Buscando hashes existentes...');
+    const mapa = new Map();
+    let offset = 0;
+    const limite = 1000;
+    let totalBuscado = 0;
+    
+    while (true) {
+        const { data, error } = await supabase
+            .from('cache_xml_externo')
+            .select('listing_id, data_hash')
+            .eq('xml_provider', PROVIDER_NAME)
+            .order('listing_id')
+            .range(offset, offset + limite - 1);
+        
+        if (error) {
+            console.error(`   Erro na busca offset ${offset}:`, error.message);
+            break;
+        }
+        
+        if (!data || data.length === 0) {
+            console.log(`   Fim da busca no offset ${offset}`);
+            break;
+        }
+        
+        data.forEach(item => {
+            mapa.set(item.listing_id, item.data_hash || '');
+        });
+        
+        totalBuscado += data.length;
+        console.log(`   ... buscados ${totalBuscado} registros`);
+        
+        if (data.length < limite) break;
+        offset += limite;
+    }
+    
+    return mapa;
 }
 
 async function registrarLog(stats) {
     try {
-        const logData = {
+        await supabase.from('import_logs').insert({
             data_execucao: new Date().toISOString(),
             status: stats.erro ? 'erro' : 'sucesso',
             total_xml: stats.totalXml,
             novos: stats.novos,
             atualizados: stats.atualizados,
             removidos: stats.desativados,
+            sem_alteracao: stats.semAlteracao,
             mensagem_erro: stats.mensagemErro || null
-        };
-        
-        // Tenta incluir sem_alteracao se a coluna existir
-        if (stats.semAlteracao !== undefined) {
-            logData.sem_alteracao = stats.semAlteracao;
-        }
-        
-        const { error } = await supabase.from('import_logs').insert(logData);
-        
-        if (error) {
-            console.error('⚠️ Erro ao salvar log:', error.message);
-        } else {
-            console.log('📝 Log de importação registrado!');
-        }
+        });
+        console.log('📝 Log registrado!');
     } catch (err) {
-        console.error('⚠️ Falha ao registrar log:', err.message);
+        console.error('⚠️ Erro ao salvar log:', err.message);
     }
 }
 
 // ============================================
-// BUSCA TODOS OS REGISTROS (COM PAGINAÇÃO)
+// FUNÇÃO PRINCIPAL
 // ============================================
-async function buscarTodosExistentes() {
-    const todos = [];
-    let offset = 0;
-    const limite = 1000;
-    
-    while (true) {
-        const { data, error } = await supabase
-            .from('cache_xml_externo')
-            .select('listing_id, titulo, tipo, finalidade, endereco, cidade, bairro, quartos, suites, banheiros, vagas_garagem, area_total, area_util, valor_venda, valor_aluguel, valor_condominio, descricao, fotos_urls')
-            .eq('xml_provider', PROVIDER_NAME)
-            .range(offset, offset + limite - 1);
-        
-        if (error) {
-            throw new Error(`Erro ao buscar existentes: ${error.message}`);
-        }
-        
-        if (!data || data.length === 0) break;
-        
-        todos.push(...data);
-        
-        if (data.length < limite) break;
-        
-        offset += limite;
-    }
-    
-    return todos;
-}
 
 async function runImport() {
     console.log('');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('🚀 INICIANDO SINCRONIZAÇÃO XML');
+    console.log('🚀 SINCRONIZAÇÃO XML - v3.0');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('');
     
     let stats = { 
         totalXml: 0, 
         novos: 0, 
         atualizados: 0, 
         semAlteracao: 0,
-        desativados: 0, 
-        erros: 0,
+        desativados: 0,
         erro: false,
         mensagemErro: null
     };
 
     try {
-        // ============================================
-        // PASSO 1: Buscar TODOS os dados existentes
-        // ============================================
-        console.log('📦 Passo 1: Buscando TODOS os dados existentes...');
-        
-        const existentes = await buscarTodosExistentes();
-        
-        const dadosExistentes = new Map();
-        existentes.forEach(e => {
-            dadosExistentes.set(e.listing_id, {
-                hash: gerarHash(e),
-                dados: e
-            });
-        });
-        
-        console.log(`   ✓ ${dadosExistentes.size} imóveis encontrados no banco`);
-
-        // ============================================
-        // PASSO 2: Resetar flags
-        // ============================================
+        // PASSO 1: Buscar hashes existentes
         console.log('');
-        console.log('🔄 Passo 2: Resetando flags seen_today...');
-        
-        await supabase
+        console.log('📦 Passo 1: Buscando dados existentes...');
+        const hashesExistentes = await buscarHashesExistentes();
+        console.log(`   ✅ ${hashesExistentes.size} imóveis no banco`);
+
+        // PASSO 2: Resetar flags
+        console.log('');
+        console.log('🔄 Passo 2: Resetando flags...');
+        const { error: errReset } = await supabase
             .from('cache_xml_externo')
             .update({ seen_today: false })
             .eq('xml_provider', PROVIDER_NAME);
         
-        console.log('   ✓ Flags resetadas');
+        if (errReset) console.warn('   ⚠️ Aviso reset:', errReset.message);
+        else console.log('   ✅ Flags resetadas');
 
-        // ============================================
-        // PASSO 3: Baixar e parsear XML
-        // ============================================
+        // PASSO 3: Baixar XML
         console.log('');
         console.log('📥 Passo 3: Baixando XML...');
-        
         const response = await axios.get(XML_URL, { 
             timeout: 120000,
-            responseType: 'text',
-            maxContentLength: 100 * 1024 * 1024
+            responseType: 'text'
         });
-        
-        console.log('   ✓ XML baixado, parseando...');
         
         const parser = new XMLParser({ 
             ignoreAttributes: false, 
-            attributeNamePrefix: "@_",
-            parseTagValue: false
+            attributeNamePrefix: "@_"
         });
         const jsonData = parser.parse(response.data);
         
         const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
-        if (!listingsRaw) {
-            throw new Error("XML vazio ou estrutura inválida");
-        }
+        if (!listingsRaw) throw new Error("XML vazio ou inválido");
         
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
-        
-        console.log(`   ✓ ${stats.totalXml} imóveis no XML`);
+        console.log(`   ✅ ${stats.totalXml} imóveis no XML`);
 
-        // ============================================
-        // PASSO 4: Processar imóveis
-        // ============================================
+        // PASSO 4: Processar
         console.log('');
-        console.log('⚙️ Passo 4: Processando imóveis...');
+        console.log('⚙️ Passo 4: Processando...');
         
         const idsProcessados = new Set();
         
@@ -222,7 +195,6 @@ async function runImport() {
             
             for (const item of batch) {
                 const listing_id = lerTexto(item.ListingID);
-                
                 if (!listing_id || idsProcessados.has(listing_id)) continue;
                 idsProcessados.add(listing_id);
 
@@ -247,11 +219,8 @@ async function runImport() {
                 mediaItems.forEach(m => {
                     const url = lerTexto(m);
                     if (url && url.startsWith('http')) {
-                        if ((m['@_primary'] === 'true' || m['@_primary'] === true) && !capa) {
-                            capa = url;
-                        } else {
-                            fotos.push(url);
-                        }
+                        if ((m['@_primary'] === 'true' || m['@_primary'] === true) && !capa) capa = url;
+                        else fotos.push(url);
                     }
                 });
                 if (capa) fotos.unshift(capa);
@@ -286,26 +255,30 @@ async function runImport() {
                     xml_provider: PROVIDER_NAME
                 };
 
-                const existente = dadosExistentes.get(listing_id);
+                // Calcular hash dos dados novos
+                const hashNovo = gerarHash(dadosImovel);
+                dadosImovel.data_hash = hashNovo;
+
+                // Verificar se existe e se mudou
+                const hashAntigo = hashesExistentes.get(listing_id);
                 
-                if (!existente) {
+                if (hashAntigo === undefined) {
+                    // NOVO - não existe no banco
                     stats.novos++;
                     upsertData.push(dadosImovel);
+                } else if (hashAntigo !== hashNovo) {
+                    // ATUALIZADO - hash diferente
+                    stats.atualizados++;
+                    upsertData.push(dadosImovel);
                 } else {
-                    const hashNovo = gerarHash(dadosImovel);
-                    
-                    if (hashNovo !== existente.hash) {
-                        stats.atualizados++;
-                        upsertData.push(dadosImovel);
-                    } else {
-                        stats.semAlteracao++;
-                        upsertData.push({
-                            listing_id,
-                            seen_today: true,
-                            last_sync: new Date().toISOString(),
-                            status: 'ativo'
-                        });
-                    }
+                    // SEM ALTERAÇÃO - só atualiza flags
+                    stats.semAlteracao++;
+                    upsertData.push({
+                        listing_id,
+                        seen_today: true,
+                        last_sync: new Date().toISOString(),
+                        status: 'ativo'
+                    });
                 }
             }
 
@@ -315,18 +288,16 @@ async function runImport() {
                     .upsert(upsertData, { onConflict: 'listing_id' });
                     
                 if (error) {
-                    stats.erros += upsertData.length;
-                    console.error(`   ❌ Erro no batch: ${error.message}`);
+                    console.error(`   ❌ Erro batch: ${error.message}`);
                 }
             }
             
-            const progresso = Math.min(i + BATCH_SIZE, listings.length);
-            console.log(`   📊 ${progresso}/${listings.length}`);
+            if ((i + BATCH_SIZE) % 200 === 0 || i + BATCH_SIZE >= listings.length) {
+                console.log(`   📊 ${Math.min(i + BATCH_SIZE, listings.length)}/${listings.length}`);
+            }
         }
 
-        // ============================================
         // PASSO 5: Inativar removidos
-        // ============================================
         console.log('');
         console.log('🗑️ Passo 5: Inativando removidos...');
         
@@ -340,36 +311,34 @@ async function runImport() {
                 .from('cache_xml_externo')
                 .update({ status: 'inativo' })
                 .match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
-            
             stats.desativados = paraDesativar.length;
         }
         
-        console.log(`   ✓ ${stats.desativados} removidos`);
-        
-        // ============================================
         // RESULTADO
-        // ============================================
         console.log('');
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.log('✅ SINCRONIZAÇÃO CONCLUÍDA!');
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         console.log(`   📄 Total XML:       ${stats.totalXml}`);
         console.log(`   🆕 Novos:           ${stats.novos}`);
         console.log(`   🔄 Atualizados:     ${stats.atualizados}`);
         console.log(`   ✨ Sem alteração:   ${stats.semAlteracao}`);
         console.log(`   ❌ Removidos:       ${stats.desativados}`);
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        
         // Validação
-        const total = stats.novos + stats.atualizados + stats.semAlteracao;
-        if (total !== stats.totalXml) {
-            console.warn(`⚠️ Diferença: processados=${total}, XML=${stats.totalXml}`);
+        const totalProcessado = stats.novos + stats.atualizados + stats.semAlteracao;
+        console.log(`   🔍 Validação: ${totalProcessado}/${stats.totalXml}`);
+        
+        if (totalProcessado !== stats.totalXml) {
+            console.warn(`   ⚠️ DIFERENÇA DE ${stats.totalXml - totalProcessado} IMÓVEIS!`);
         }
 
         await registrarLog(stats);
 
     } catch (error) {
-        console.error('💥 ERRO:', error.message);
+        console.error('');
+        console.error('💥 ERRO FATAL:', error.message);
         stats.erro = true;
         stats.mensagemErro = error.message;
         await registrarLog(stats);
