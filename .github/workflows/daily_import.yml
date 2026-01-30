@@ -1,9 +1,19 @@
 name: Importação Diária XML
 on:
   schedule:
-    # Roda todo dia às 08:00 UTC (05:00 Horário de Brasília)
+    # 05:00 Brasília (09:00 UTC)
     - cron: '0 8 * * *'
-  # Permite rodar manualmente clicando num botão (bom para testes)
+    
+    # 10:00 Brasília (13:00 UTC)
+    - cron: '0 13 * * *'
+    
+    # 14:00 Brasília (17:00 UTC)
+    - cron: '0 17 * * *'
+    
+    # 18:00 Brasília (21:00 UTC)
+    - cron: '0 21 * * *'
+    
+  # Permite execução manual
   workflow_dispatch:
 
 jobs:
