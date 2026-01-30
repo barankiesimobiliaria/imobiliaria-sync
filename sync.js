@@ -9,161 +9,242 @@ const PROVIDER_NAME = 'RedeUrbana';
 const BATCH_SIZE = 50;
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-    console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas.");
-    process.exit(1);
+  console.error('❌ SUPABASE_URL ou SUPABASE_KEY não configuradas');
+  process.exit(1);
 }
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-    auth: { persistSession: false }
+  auth: { persistSession: false }
 });
 
-// --- FUNÇÕES AUXILIARES ---
+/* ================= HELPERS ================= */
+
 function lerValor(campo) {
-    if (campo === undefined || campo === null) return 0;
-    if (typeof campo === 'object') return campo['#text'] ? parseFloat(campo['#text']) : 0;
-    const val = parseFloat(campo);
-    return isNaN(val) ? 0 : val;
+  if (campo === undefined || campo === null) return 0;
+  if (typeof campo === 'object') return campo['#text'] ? parseFloat(campo['#text']) : 0;
+  const v = parseFloat(campo);
+  return isNaN(v) ? 0 : v;
 }
 
 function lerTexto(campo) {
-    if (!campo) return '';
-    if (typeof campo === 'object') return campo['#text'] || '';
-    return String(campo).trim();
+  if (!campo) return '';
+  if (typeof campo === 'object') return campo['#text'] || '';
+  return String(campo).trim();
 }
 
-function lerFeatures(featuresNode) {
-    if (!featuresNode || !featuresNode.Feature) return [];
-    const feat = featuresNode.Feature;
-    const lista = Array.isArray(feat) ? feat : [feat];
-    return lista.map(f => lerTexto(f)).filter(f => f !== '');
+function lerFeatures(node) {
+  if (!node || !node.Feature) return [];
+  const lista = Array.isArray(node.Feature) ? node.Feature : [node.Feature];
+  return lista.map(f => lerTexto(f)).filter(Boolean);
 }
 
 function gerarHash(d) {
-    const str = [
-        d.titulo || '', d.tipo || '', d.finalidade || '', d.cidade || '', d.bairro || '', d.endereco || '',
-        String(d.quartos || 0), String(d.suites || 0), String(d.banheiros || 0), String(d.vagas_garagem || 0),
-        String(d.area_total || 0), String(d.area_util || 0), String(d.valor_venda || 0), String(d.valor_aluguel || 0),
-        String(d.valor_condominio || 0), d.descricao || '', JSON.stringify(d.fotos_urls || [])
-    ].join('|');
-    return crypto.createHash('md5').update(str).digest('hex');
+  const fotosOrdenadas = (d.fotos_urls || []).slice().sort();
+
+  const base = [
+    d.titulo || '',
+    d.tipo || '',
+    d.finalidade || '',
+    d.cidade || '',
+    d.bairro || '',
+    d.endereco || '',
+    d.quartos || 0,
+    d.suites || 0,
+    d.banheiros || 0,
+    d.vagas_garagem || 0,
+    d.area_total || 0,
+    d.area_util || 0,
+    d.valor_venda || 0,
+    d.valor_aluguel || 0,
+    d.valor_condominio || 0,
+    d.descricao || '',
+    JSON.stringify(fotosOrdenadas)
+  ].join('|');
+
+  return crypto.createHash('md5').update(base).digest('hex');
 }
+
+/* ================= DB ================= */
+
+async function buscarHashesExistentes() {
+  const mapa = new Map();
+  let offset = 0;
+  const limite = 1000;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('cache_xml_externo')
+      .select('listing_id, data_hash')
+      .eq('xml_provider', PROVIDER_NAME)
+      .order('listing_id')
+      .range(offset, offset + limite - 1);
+
+    if (error || !data || data.length === 0) break;
+
+    data.forEach(r => mapa.set(r.listing_id, r.data_hash || ''));
+    if (data.length < limite) break;
+    offset += limite;
+  }
+
+  return mapa;
+}
+
+async function registrarLog(stats) {
+  await supabase.from('import_logs').insert({
+    status: stats.erro === true ? 'erro' : 'sucesso',
+    total_xml: stats.totalXml,
+    novos: stats.novos,
+    atualizados: stats.atualizados,
+    removidos: stats.desativados,
+    sem_alteracao: stats.semAlteracao,
+    mensagem_erro: stats.mensagemErro || null
+  });
+}
+
+/* ================= MAIN ================= */
 
 async function runImport() {
-    console.log('🚀 INICIANDO SINCRONIZAÇÃO V5 - PROTEÇÃO TOTAL');
-    let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
+  const stats = {
+    totalXml: 0,
+    novos: 0,
+    atualizados: 0,
+    semAlteracao: 0,
+    desativados: 0,
+    erro: false,
+    mensagemErro: null
+  };
 
-    try {
-        // 1. Buscar hashes e status atuais
-        const { data: existentes } = await supabase.from('cache_xml_externo').select('listing_id, data_hash, status').eq('xml_provider', PROVIDER_NAME);
-        const dbMap = new Map((existentes || []).map(e => [e.listing_id, { hash: e.data_hash, status: e.status }]));
+  try {
+    const hashesExistentes = await buscarHashesExistentes();
 
-        // 2. Baixar XML (Fazemos o download ANTES de qualquer alteração no banco)
-        const response = await axios.get(XML_URL, { timeout: 120000, responseType: 'text' });
-        const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
-        const jsonData = parser.parse(response.data);
-        const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
-        if (!listingsRaw) throw new Error("XML vazio ou inválido");
-        const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
-        stats.totalXml = listings.length;
+    await supabase
+      .from('cache_xml_externo')
+      .update({ seen_today: false })
+      .eq('xml_provider', PROVIDER_NAME);
 
-        // 3. Resetar flags seen_today APENAS se o XML foi baixado com sucesso
-        await supabase.from('cache_xml_externo').update({ seen_today: false }).eq('xml_provider', PROVIDER_NAME);
+    const response = await axios.get(XML_URL, { timeout: 120000 });
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    const json = parser.parse(response.data);
 
-        // 4. Processar Imóveis
-        const agora = new Date().toISOString();
-        const idsNoXml = new Set();
+    const listingsRaw = json?.ListingDataFeed?.Listings?.Listing;
+    if (!listingsRaw) throw new Error('XML inválido');
 
-        for (let i = 0; i < listings.length; i += BATCH_SIZE) {
-            const batch = listings.slice(i, i + BATCH_SIZE);
-            const upsertData = [];
-            
-            for (const item of batch) {
-                const listing_id = lerTexto(item.ListingID);
-                if (!listing_id) continue;
-                idsNoXml.add(listing_id);
+    const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
+    stats.totalXml = listings.length;
 
-                const details = item.Details || {};
-                const location = item.Location || {};
-                const transacao = lerTexto(item.TransactionType);
-                let vVenda = 0, vAluguel = 0;
-                const pVenda = lerValor(details.ListPrice);
-                const pAluguel = lerValor(details.RentalPrice);
-                if (transacao === 'For Rent') vAluguel = pAluguel || pVenda;
-                else if (transacao === 'For Sale') vVenda = pVenda;
-                else { vVenda = pVenda; vAluguel = pAluguel; }
+    const idsProcessados = new Set();
+    const agora = new Date().toISOString();
 
-                let mediaItems = item.Media?.Item ? (Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item]) : [];
-                let fotos = [];
-                let capa = null;
-                mediaItems.forEach(m => {
-                    const url = lerTexto(m);
-                    if (url && url.startsWith('http')) {
-                        if ((m['@_primary'] === 'true' || m['@_primary'] === true) && !capa) capa = url;
-                        else fotos.push(url);
-                    }
-                });
-                if (capa) fotos.unshift(capa);
+    for (let i = 0; i < listings.length; i += BATCH_SIZE) {
+      const batch = listings.slice(i, i + BATCH_SIZE);
+      const upsertData = [];
 
-                const dadosBase = {
-                    listing_id, titulo: lerTexto(item.Title), tipo: lerTexto(details.PropertyType), finalidade: transacao,
-                    status: 'ativo', endereco: lerTexto(location.Address), cidade: lerTexto(location.City)?.toUpperCase() || null,
-                    bairro: lerTexto(location.Neighborhood), uf: lerTexto(location.State) || 'PR',
-                    latitude: location.Latitude ? String(location.Latitude) : null, longitude: location.Longitude ? String(location.Longitude) : null,
-                    quartos: parseInt(lerValor(details.Bedrooms)) || 0, suites: parseInt(lerValor(details.Suites)) || 0,
-                    banheiros: parseInt(lerValor(details.Bathrooms)) || 0, vagas_garagem: parseInt(lerValor(details.Garage)) || 0,
-                    area_total: lerValor(details.LotArea), area_util: lerValor(details.LivingArea),
-                    valor_venda: vVenda, valor_aluguel: vAluguel, valor_condominio: lerValor(details.PropertyAdministrationFee),
-                    iptu: lerValor(details.YearlyTax) || lerValor(details.MonthlyTax), descricao: lerTexto(details.Description),
-                    diferenciais: lerFeatures(details.Features), fotos_urls: fotos, seen_today: true, last_sync: agora, xml_provider: PROVIDER_NAME
-                };
+      for (const item of batch) {
+        const listing_id = lerTexto(item.ListingID);
+        if (!listing_id || idsProcessados.has(listing_id)) continue;
+        idsProcessados.add(listing_id);
 
-                const hashNovo = gerarHash(dadosBase);
-                dadosBase.data_hash = hashNovo;
-                const registroExistente = dbMap.get(listing_id);
+        const details = item.Details || {};
+        const location = item.Location || {};
 
-                if (!registroExistente) {
-                    stats.novos++;
-                    dadosBase.data_ultima_alteracao = agora;
-                    upsertData.push(dadosBase);
-                } else if (registroExistente.hash !== hashNovo) {
-                    stats.atualizados++;
-                    dadosBase.data_ultima_alteracao = agora;
-                    upsertData.push(dadosBase);
-                } else {
-                    stats.semAlteracao++;
-                    // SEMPRE enviamos o status 'ativo' e 'seen_today' para garantir paridade
-                    upsertData.push({ listing_id, status: 'ativo', seen_today: true, last_sync: agora });
-                }
-            }
-            if (upsertData.length > 0) {
-                const { error } = await supabase.from('cache_xml_externo').upsert(upsertData, { onConflict: 'listing_id' });
-                if (error) console.error(`   ❌ Erro batch: ${error.message}`);
-            }
-        }
+        const transacaoRaw = lerTexto(item.TransactionType).toLowerCase();
+        const venda = transacaoRaw.includes('sale');
+        const aluguel = transacaoRaw.includes('rent');
 
-        // 5. Inativar removidos (PROTEÇÃO: Só inativa se processamos todos os IDs do XML)
-        if (idsNoXml.size >= stats.totalXml) {
-            const { data: desativados } = await supabase
-                .from('cache_xml_externo')
-                .update({ status: 'inativo' })
-                .match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' })
-                .select('listing_id');
-            stats.desativados = desativados ? desativados.length : 0;
-        } else {
-            console.error('⚠️ Aviso: Processamento incompleto. Inativação cancelada para segurança.');
-        }
+        const fotos = [];
+        const media = item.Media?.Item
+          ? Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item]
+          : [];
 
-        // 6. Registrar Log
-        await supabase.from('import_logs').insert({
-            data_execucao: agora, status: 'sucesso', total_xml: stats.totalXml,
-            novos: stats.novos, atualizados: stats.atualizados, removidos: stats.desativados, sem_alteracao: stats.semAlteracao
+        media.forEach(m => {
+          const url = lerTexto(m);
+          if (url.startsWith('http')) fotos.push(url);
         });
 
-        console.log('✅ Sincronização concluída!');
-    } catch (error) {
-        console.error('💥 Erro:', error.message);
-        await supabase.from('import_logs').insert({ data_execucao: new Date().toISOString(), status: 'erro', mensagem_erro: error.message });
-        process.exit(1);
+        const dados = {
+          listing_id,
+          xml_provider: PROVIDER_NAME,
+          titulo: lerTexto(item.Title),
+          tipo: lerTexto(details.PropertyType),
+          finalidade: lerTexto(item.TransactionType),
+          status: 'ativo',
+          endereco: lerTexto(location.Address),
+          cidade: lerTexto(location.City)?.toUpperCase() || null,
+          bairro: lerTexto(location.Neighborhood),
+          uf: lerTexto(location.State) || 'PR',
+          latitude: location.Latitude ? String(location.Latitude) : null,
+          longitude: location.Longitude ? String(location.Longitude) : null,
+          quartos: parseInt(lerValor(details.Bedrooms)) || 0,
+          suites: parseInt(lerValor(details.Suites)) || 0,
+          banheiros: parseInt(lerValor(details.Bathrooms)) || 0,
+          vagas_garagem: parseInt(lerValor(details.Garage)) || 0,
+          area_total: lerValor(details.LotArea),
+          area_util: lerValor(details.LivingArea),
+          valor_venda: venda ? lerValor(details.ListPrice) : 0,
+          valor_aluguel: aluguel ? lerValor(details.RentalPrice) : 0,
+          valor_condominio: lerValor(details.PropertyAdministrationFee),
+          iptu: lerValor(details.YearlyTax) || lerValor(details.MonthlyTax),
+          descricao: lerTexto(details.Description),
+          diferenciais: lerFeatures(details.Features),
+          fotos_urls: fotos.sort(),
+          seen_today: true,
+          last_sync: agora
+        };
+
+        const hashNovo = gerarHash(dados);
+        const hashAntigo = hashesExistentes.get(listing_id);
+
+        dados.data_hash = hashNovo;
+
+        if (hashAntigo === undefined || hashAntigo !== hashNovo) {
+          dados.data_ultima_alteracao = agora;
+          hashAntigo === undefined ? stats.novos++ : stats.atualizados++;
+          upsertData.push(dados);
+        } else {
+          stats.semAlteracao++;
+          upsertData.push({
+            listing_id,
+            xml_provider: PROVIDER_NAME,
+            status: 'ativo',
+            seen_today: true,
+            last_sync: agora
+          });
+        }
+      }
+
+      if (upsertData.length) {
+        await supabase
+          .from('cache_xml_externo')
+          .upsert(upsertData, {
+            onConflict: 'listing_id,xml_provider'
+          });
+      }
     }
+
+    const { data: inativar } = await supabase
+      .from('cache_xml_externo')
+      .select('listing_id')
+      .eq('xml_provider', PROVIDER_NAME)
+      .eq('seen_today', false);
+
+    if (inativar?.length) {
+      await supabase
+        .from('cache_xml_externo')
+        .update({ status: 'inativo' })
+        .eq('xml_provider', PROVIDER_NAME)
+        .eq('seen_today', false);
+
+      stats.desativados = inativar.length;
+    }
+
+    await registrarLog(stats);
+
+  } catch (err) {
+    stats.erro = true;
+    stats.mensagemErro = err.message;
+    await registrarLog(stats);
+    throw err;
+  }
 }
+
 runImport();
