@@ -4,7 +4,6 @@ const axios = require('axios');
 const { XMLParser } = require('fast-xml-parser');
 const crypto = require('crypto');
 
-// Variáveis de Configuração
 const XML_URL = 'https://redeurbana.com.br/imoveis/rede/2e2b5834-643b-49c1-8289-005b800168e9';
 const PROVIDER_NAME = 'RedeUrbana';
 const BATCH_SIZE = 50;
@@ -60,7 +59,6 @@ function gerarHash(d) {
         d.descricao || '',
         JSON.stringify(d.fotos_urls || [])
     ].join('|');
-    
     return crypto.createHash('md5').update(str).digest('hex');
 }
 
@@ -71,10 +69,12 @@ async function buscarDadosExistentes() {
     const limite = 1000;
     
     while (true) {
+        // MUDANÇA CRÍTICA: Removemos o filtro de xml_provider na busca inicial.
+        // Se o imóvel já existe no banco (mesmo que por outro provider), 
+        // o script deve reconhecê-lo para evitar erro de duplicidade no upsert.
         const { data, error } = await supabase
             .from(TABELA_CACHE)
-            .select('listing_id, data_hash') 
-            .eq('xml_provider', PROVIDER_NAME)
+            .select('listing_id, data_hash, xml_provider') 
             .range(offset, offset + limite - 1);
         
         if (error) {
@@ -85,15 +85,17 @@ async function buscarDadosExistentes() {
         if (!data || data.length === 0) break;
         
         data.forEach(item => {
-            // Normalizamos a chave para evitar problemas de case/espaço
-            mapa.set(String(item.listing_id).trim(), item.data_hash || '');
+            mapa.set(String(item.listing_id).trim(), {
+                hash: item.data_hash || '',
+                provider: item.xml_provider
+            });
         });
         
         if (data.length < limite) break;
         offset += limite;
     }
     
-    console.log(`   ✅ ${mapa.size} registros carregados para comparação`);
+    console.log(`   ✅ ${mapa.size} registros carregados no cache global`);
     return mapa;
 }
 
@@ -118,13 +120,10 @@ async function registrarLog(stats) {
 async function runImport() {
     console.log('');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('🚀 SINCRONIZAÇÃO XML - CORREÇÃO FINAL');
+    console.log('🚀 SINCRONIZAÇÃO XML - V4 (GLOBAL CACHE)');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     
-    let stats = { 
-        totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0,
-        erro: false, mensagemErro: null
-    };
+    let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
 
     try {
         const dadosExistentes = await buscarDadosExistentes();
@@ -133,16 +132,14 @@ async function runImport() {
         await supabase.from(TABELA_CACHE).update({ seen_today: false }).eq('xml_provider', PROVIDER_NAME);
 
         console.log('📥 Baixando XML...');
-        const response = await axios.get(XML_URL, { timeout: 120000 });
+        const response = await axios.get(XML_URL);
         const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
         const jsonData = parser.parse(response.data);
         
         const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
         if (!listingsRaw) throw new Error("XML vazio ou inválido");
-        
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
-        console.log(`   ✅ ${stats.totalXml} imóveis no XML`);
 
         const idsProcessados = new Set();
         const agora = new Date().toISOString();
@@ -152,11 +149,8 @@ async function runImport() {
             const upsertData = [];
             
             for (const item of batch) {
-                const raw_id = lerTexto(item.ListingID);
-                if (!raw_id) continue;
-                
-                const listing_id = raw_id.trim();
-                if (idsProcessados.has(listing_id)) continue;
+                const listing_id = lerTexto(item.ListingID);
+                if (!listing_id || idsProcessados.has(listing_id)) continue;
                 idsProcessados.add(listing_id);
 
                 const details = item.Details || {};
@@ -215,24 +209,23 @@ async function runImport() {
                 const hashNovo = gerarHash(dadosImovel);
                 dadosImovel.data_hash = hashNovo;
 
-                const hashAntigo = dadosExistentes.get(listing_id);
+                const registroAntigo = dadosExistentes.get(listing_id);
                 
-                if (hashAntigo === undefined) {
+                // Lógica de decisão:
+                // Se não existe (mesmo em outros providers), é NOVO.
+                // Se existe mas o provider é diferente, é uma ATUALIZAÇÃO (troca de dono/xml).
+                // Se existe e o hash é diferente, é ATUALIZADO.
+                if (!registroAntigo) {
                     stats.novos++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
-                } else if (hashAntigo !== hashNovo) {
+                } else if (registroAntigo.provider !== PROVIDER_NAME || registroAntigo.hash !== hashNovo) {
                     stats.atualizados++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
                 } else {
                     stats.semAlteracao++;
-                    upsertData.push({
-                        listing_id,
-                        seen_today: true,
-                        last_sync: agora,
-                        status: 'ativo'
-                    });
+                    upsertData.push({ listing_id, seen_today: true, last_sync: agora, status: 'ativo' });
                 }
             }
 
