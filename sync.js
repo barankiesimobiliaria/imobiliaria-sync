@@ -294,9 +294,9 @@ async function runImport() {
         
         if (paraDesativar && paraDesativar.length > 0) {
             await supabase
-                .from('cache_xml_externo')
-                .update({ status: 'inativo' })
-                .match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
+    .from('cache_xml_externo')
+    .update({ status: 'inativo' })
+    .match({ xml_provider: PROVIDER_NAME, seen_today: false });
             stats.desativados = paraDesativar.length;
         }
         
