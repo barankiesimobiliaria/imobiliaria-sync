@@ -246,24 +246,24 @@ async function runImport() {
 
                 const hashAntigo = hashesExistentes.get(listing_id);
                 
-                if (hashAntigo === undefined) {
-                    // NOVO
-                    stats.novos++;
-                    dadosImovel.data_ultima_alteracao = agora; // Data de criação = data de alteração
-                    upsertData.push(dadosImovel);
-                } else if (hashAntigo !== hashNovo) {
-                    // ATUALIZADO - hash diferente, houve mudança real
-                    stats.atualizados++;
-                    dadosImovel.data_ultima_alteracao = agora; // Atualiza data de alteração
+                // ✅ CORREÇÃO APLICADA AQUI
+                if (hashAntigo === undefined || hashAntigo !== hashNovo) {
+                    // NOVO ou ALTERADO: Envia objeto completo
+                    if (hashAntigo === undefined) {
+                        stats.novos++;
+                    } else {
+                        stats.atualizados++;
+                    }
+                    dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
                 } else {
-                    // SEM ALTERAÇÃO - só atualiza flags (NÃO atualiza data_ultima_alteracao)
+                    // SEM ALTERAÇÃO DE DADOS: Mas PRECISA forçar o status e a flag
                     stats.semAlteracao++;
                     upsertData.push({
                         listing_id,
-                        seen_today: true,
-                        last_sync: agora,
-                        status: 'ativo'
+                        status: 'ativo',      // <--- FORÇA O STATUS ATIVO
+                        seen_today: true,     // <--- GARANTE QUE NÃO SEJA INATIVADO NO PASSO 5
+                        last_sync: agora
                     });
                 }
             }
@@ -290,13 +290,13 @@ async function runImport() {
         const { data: paraDesativar } = await supabase
             .from('cache_xml_externo')
             .select('listing_id')
-            .match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
+            .match({ xml_provider: PROVIDER_NAME, seen_today: false });
         
         if (paraDesativar && paraDesativar.length > 0) {
             await supabase
-    .from('cache_xml_externo')
-    .update({ status: 'inativo' })
-    .match({ xml_provider: PROVIDER_NAME, seen_today: false });
+                .from('cache_xml_externo')
+                .update({ status: 'inativo' })
+                .match({ xml_provider: PROVIDER_NAME, seen_today: false });
             stats.desativados = paraDesativar.length;
         }
         
