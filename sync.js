@@ -36,29 +36,34 @@ function lerFeatures(featuresNode) {
     if (!featuresNode || !featuresNode.Feature) return [];
     const feat = featuresNode.Feature;
     const lista = Array.isArray(feat) ? feat : [feat];
-    return lista.map(f => lerTexto(f)).filter(f => f !== '');
+    return lista.map(f => lerTexto(f)).filter(f => f !== '').sort(); // Sort para estabilidade do hash
 }
 
+/**
+ * Gera um Hash robusto focado apenas nos dados vitais.
+ * Ignora campos de sistema como datas de sincronização que mudam sempre.
+ */
 function gerarHash(d) {
     const str = [
-        d.titulo || '',
-        d.tipo || '',
-        d.finalidade || '',
-        d.cidade || '',
-        d.bairro || '',
-        d.endereco || '',
-        String(d.quartos || 0),
-        String(d.suites || 0),
-        String(d.banheiros || 0),
-        String(d.vagas_garagem || 0),
-        String(d.area_total || 0),
-        String(d.area_util || 0),
-        String(d.valor_venda || 0),
-        String(d.valor_aluguel || 0),
-        String(d.valor_condominio || 0),
-        d.descricao || '',
-        JSON.stringify(d.fotos_urls || [])
-    ].join('|');
+        lerTexto(d.titulo),
+        lerTexto(d.tipo),
+        lerTexto(d.finalidade),
+        lerTexto(d.cidade),
+        lerTexto(d.bairro),
+        lerTexto(d.endereco),
+        String(parseInt(d.quartos) || 0),
+        String(parseInt(d.suites) || 0),
+        String(parseInt(d.banheiros) || 0),
+        String(parseInt(d.vagas_garagem) || 0),
+        String(Number(d.area_total).toFixed(2)),
+        String(Number(d.area_util).toFixed(2)),
+        String(Number(d.valor_venda).toFixed(2)),
+        String(Number(d.valor_aluguel).toFixed(2)),
+        String(Number(d.valor_condominio).toFixed(2)),
+        lerTexto(d.descricao).substring(0, 500), // Compara apenas o início da descrição para performance
+        (d.fotos_urls || []).join(',')
+    ].join('|').toLowerCase(); // Case-insensitive para maior estabilidade
+    
     return crypto.createHash('md5').update(str).digest('hex');
 }
 
@@ -69,9 +74,6 @@ async function buscarDadosExistentes() {
     const limite = 1000;
     
     while (true) {
-        // MUDANÇA CRÍTICA: Removemos o filtro de xml_provider na busca inicial.
-        // Se o imóvel já existe no banco (mesmo que por outro provider), 
-        // o script deve reconhecê-lo para evitar erro de duplicidade no upsert.
         const { data, error } = await supabase
             .from(TABELA_CACHE)
             .select('listing_id, data_hash, xml_provider') 
@@ -95,7 +97,7 @@ async function buscarDadosExistentes() {
         offset += limite;
     }
     
-    console.log(`   ✅ ${mapa.size} registros carregados no cache global`);
+    console.log(`   ✅ ${mapa.size} registros carregados`);
     return mapa;
 }
 
@@ -120,7 +122,7 @@ async function registrarLog(stats) {
 async function runImport() {
     console.log('');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('🚀 SINCRONIZAÇÃO XML - V4 (GLOBAL CACHE)');
+    console.log('🚀 SINCRONIZAÇÃO XML - V5 (ESTÁVEL)');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
@@ -211,10 +213,6 @@ async function runImport() {
 
                 const registroAntigo = dadosExistentes.get(listing_id);
                 
-                // Lógica de decisão:
-                // Se não existe (mesmo em outros providers), é NOVO.
-                // Se existe mas o provider é diferente, é uma ATUALIZAÇÃO (troca de dono/xml).
-                // Se existe e o hash é diferente, é ATUALIZADO.
                 if (!registroAntigo) {
                     stats.novos++;
                     dadosImovel.data_ultima_alteracao = agora;
