@@ -47,8 +47,6 @@ function lerFeatures(featuresNode) {
 
 /**
  * Gera um Hash ultra-estável focado apenas nos dados vitais.
- * Normaliza números para evitar diferenças de .00 vs .0
- * Limpa descrições de caracteres especiais e ignora a ordem de fotos/diferenciais.
  */
 function gerarHash(d) {
     const normalizarNumero = (n) => {
@@ -72,8 +70,7 @@ function gerarHash(d) {
         normalizarNumero(d.valor_venda),
         normalizarNumero(d.valor_aluguel),
         normalizarNumero(d.valor_condominio),
-        // Limpa a descrição de caracteres especiais e espaços para o hash
-        lerTexto(d.descricao).substring(0, 500).replace(/[^a-zA-Z0-9 ]/g, ""), // Permite espaços
+        lerTexto(d.descricao).substring(0, 500).replace(/[^a-zA-Z0-9 ]/g, ""),
         (d.fotos_urls || []).sort().join(","),
         (d.diferenciais || []).sort().join(",")
     ].join("|").toLowerCase();
@@ -90,7 +87,7 @@ async function buscarDadosExistentes() {
     while (true) {
         const { data, error } = await supabase
             .from(TABELA_CACHE)
-            .select("listing_id, data_hash, xml_provider") 
+            .select("listing_id, data_hash, xml_provider, status") 
             .range(offset, offset + limite - 1);
         
         if (error) {
@@ -103,7 +100,8 @@ async function buscarDadosExistentes() {
         data.forEach(item => {
             mapa.set(String(item.listing_id).trim(), {
                 hash: item.data_hash || "",
-                provider: item.xml_provider
+                provider: item.xml_provider,
+                status: item.status
             });
         });
         
@@ -136,7 +134,7 @@ async function registrarLog(stats) {
 async function runImport() {
     console.log("");
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    console.log("🚀 SINCRONIZAÇÃO XML - V7 (ULTRA-ESTÁVEL)");
+    console.log("🚀 SINCRONIZAÇÃO XML - V7 (REVISADA)");
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
@@ -145,6 +143,7 @@ async function runImport() {
         const dadosExistentes = await buscarDadosExistentes();
 
         console.log("🔄 Resetando flags...");
+        // Resetamos seen_today para todos os imóveis deste provedor
         await supabase.from(TABELA_CACHE).update({ seen_today: false }).eq("xml_provider", PROVIDER_NAME);
 
         console.log("📥 Baixando XML...");
@@ -157,7 +156,7 @@ async function runImport() {
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
 
-        const idsProcessados = new Set();
+        const idsProcessadosNoXml = new Set();
         const agora = new Date().toISOString();
         
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
@@ -166,8 +165,8 @@ async function runImport() {
             
             for (const item of batch) {
                 const listing_id = lerTexto(item.ListingID);
-                if (!listing_id || idsProcessados.has(listing_id)) continue;
-                idsProcessados.add(listing_id);
+                if (!listing_id || idsProcessadosNoXml.has(listing_id)) continue;
+                idsProcessadosNoXml.add(listing_id);
 
                 const details = item.Details || {};
                 const location = item.Location || {};
@@ -197,7 +196,7 @@ async function runImport() {
                     titulo: lerTexto(item.Title),
                     tipo: lerTexto(details.PropertyType),
                     finalidade: transacao,
-                    status: "ativo",
+                    status: "ativo", // Regra: Está no XML, deve estar ativo
                     endereco: lerTexto(location.Address),
                     cidade: lerTexto(location.City)?.toUpperCase() || null,
                     bairro: lerTexto(location.Neighborhood),
@@ -228,18 +227,17 @@ async function runImport() {
                 const registroAntigo = dadosExistentes.get(listing_id);
                 
                 if (!registroAntigo) {
+                    // NOVO: Não existe no banco
                     stats.novos++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
-                } else if (registroAntigo.provider !== PROVIDER_NAME || registroAntigo.hash !== hashNovo) {
-                    // Log de depuração para os primeiros casos de atualização
-                    if (stats.atualizados < 5) {
-                        console.log(`🔍 Depurando ID ${listing_id}: Hash mudou de ${registroAntigo.hash} para ${hashNovo}`);
-                    }
+                } else if (registroAntigo.provider !== PROVIDER_NAME || registroAntigo.hash !== hashNovo || registroAntigo.status !== "ativo") {
+                    // ATUALIZADO: Mudou hash, provedor ou estava inativo e agora está no XML (reativar)
                     stats.atualizados++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
                 } else {
+                    // SEM ALTERAÇÃO: Já está ativo e o hash é o mesmo
                     stats.semAlteracao++;
                     upsertData.push({ listing_id, seen_today: true, last_sync: agora, status: "ativo" });
                 }
@@ -252,10 +250,29 @@ async function runImport() {
         }
 
         console.log("🗑️ Inativando removidos...");
-        const { data: paraDesativar } = await supabase.from(TABELA_CACHE).select("listing_id").match({ xml_provider: PROVIDER_NAME, seen_today: false, status: "ativo" });
+        // Regra: Não está no XML (seen_today: false) e está ativo no banco -> Inativar
+        const { data: paraDesativar, error: errorBusca } = await supabase
+            .from(TABELA_CACHE)
+            .select("listing_id")
+            .eq("xml_provider", PROVIDER_NAME)
+            .eq("seen_today", false)
+            .eq("status", "ativo");
+
+        if (errorBusca) throw new Error(`Erro ao buscar removidos: ${errorBusca.message}`);
+
         if (paraDesativar && paraDesativar.length > 0) {
-            await supabase.from(TABELA_CACHE).update({ status: "inativo", data_ultima_alteracao: agora }).match({ xml_provider: PROVIDER_NAME, seen_today: false, status: "ativo" });
+            console.log(`   Encontrados ${paraDesativar.length} imóveis para inativar.`);
+            const { error: errorUpdate } = await supabase
+                .from(TABELA_CACHE)
+                .update({ status: "inativo", data_ultima_alteracao: agora })
+                .eq("xml_provider", PROVIDER_NAME)
+                .eq("seen_today", false)
+                .eq("status", "ativo");
+            
+            if (errorUpdate) throw new Error(`Erro ao inativar: ${errorUpdate.message}`);
             stats.desativados = paraDesativar.length;
+        } else {
+            console.log("   Nenhum imóvel para inativar.");
         }
         
         console.log("✅ CONCLUÍDO!");
