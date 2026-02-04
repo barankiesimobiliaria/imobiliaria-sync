@@ -10,7 +10,7 @@ const BATCH_SIZE = 50;
 const TABELA_CACHE = "cache_xml_externo";
 const TABELA_LOGS = "import_logs";
 
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY ) {
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
     console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas.");
     process.exit(1);
 }
@@ -77,16 +77,16 @@ function gerarHash(d) {
 }
 
 async function buscarDadosExistentes() {
-    console.log("   Buscando estado atual do banco de dados...");
+    console.log("   Buscando TODOS os imóveis do banco (Sincronia Global)...");
     const mapa = new Map();
     let offset = 0;
     const limite = 1000;
     
     while (true) {
+        // REMOVIDO FILTRO DE PROVEDOR PARA GARANTIR QUE ENCONTRAMOS TUDO
         const { data, error } = await supabase
             .from(TABELA_CACHE)
             .select("listing_id, data_hash, xml_provider, status") 
-            .eq("xml_provider", PROVIDER_NAME)
             .range(offset, offset + limite - 1);
         
         if (error) throw error;
@@ -95,13 +95,15 @@ async function buscarDadosExistentes() {
         data.forEach(item => {
             mapa.set(String(item.listing_id).trim(), {
                 hash: item.data_hash || "",
-                status: item.status
+                status: item.status,
+                provider: item.xml_provider
             });
         });
         
         if (data.length < limite) break;
         offset += limite;
     }
+    console.log(`   ✅ ${mapa.size} registros totais carregados do banco.`);
     return mapa;
 }
 
@@ -126,14 +128,16 @@ async function registrarLog(stats) {
 // --- CORE DA SINCRONIZAÇÃO ---
 
 async function runImport() {
-    console.log("\n🚀 INICIANDO SINCRONIZAÇÃO DEFINITIVA");
+    console.log("\n🚀 INICIANDO SINCRONIZAÇÃO GLOBAL DEFINITIVA");
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
 
     try {
         const dadosExistentes = await buscarDadosExistentes();
 
-        console.log("📥 Baixando XML...");
-        const response = await axios.get(XML_URL);
+        console.log(`📥 Baixando XML de: ${XML_URL}`);
+        const response = await axios.get(XML_URL, { headers: { 'Cache-Control': 'no-cache' } });
+        console.log(`   Tamanho do XML: ${(response.data.length / 1024 / 1024).toFixed(2)} MB`);
+        
         const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
         const jsonData = parser.parse(response.data);
         
@@ -145,7 +149,7 @@ async function runImport() {
         const idsNoXml = new Set();
         const agora = new Date().toISOString();
         
-        console.log(`🔄 Processando ${listings.length} imóveis...`);
+        console.log(`🔄 Processando ${listings.length} imóveis do XML...`);
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
             const upsertData = [];
@@ -159,7 +163,6 @@ async function runImport() {
                 const location = item.Location || {};
                 const transacao = lerTexto(item.TransactionType);
                 
-                // Preços e Mídia
                 let vVenda = lerValor(details.ListPrice);
                 let vAluguel = lerValor(details.RentalPrice);
                 
@@ -168,7 +171,7 @@ async function runImport() {
                 let capa = null;
                 mediaItems.forEach(m => {
                     const url = lerTexto(m);
-                    if (url && url.startsWith("http" )) {
+                    if (url && url.startsWith("http")) {
                         if ((m["@_primary"] === "true" || m["@_primary"] === true) && !capa) capa = url;
                         else fotos.push(url);
                     }
@@ -230,10 +233,12 @@ async function runImport() {
             }
         }
 
-        // --- INATIVAÇÃO DE AUSENTES ---
-        console.log("🗑️ Verificando imóveis para inativação...");
+        // --- INATIVAÇÃO DE AUSENTES (Lógica Global) ---
+        console.log("🗑️ Verificando imóveis para inativação compulsória...");
         const idsParaInativar = [];
         for (const [listing_id, info] of dadosExistentes.entries()) {
+            // Se o imóvel está ativo no banco mas NÃO veio no XML atual, inativamos.
+            // Note que agora olhamos para TODOS os imóveis do banco, independente do provedor original.
             if (info.status === "ativo" && !idsNoXml.has(listing_id)) {
                 idsParaInativar.push(listing_id);
             }
@@ -243,19 +248,34 @@ async function runImport() {
             console.log(`   Inativando ${idsParaInativar.length} imóveis ausentes no XML...`);
             for (let i = 0; i < idsParaInativar.length; i += BATCH_SIZE) {
                 const loteIds = idsParaInativar.slice(i, i + BATCH_SIZE);
-                await supabase.from(TABELA_CACHE)
-                    .update({ status: "inativo", seen_today: false, data_ultima_alteracao: agora, last_sync: agora })
-                    .in("listing_id", loteIds)
-                    .eq("xml_provider", PROVIDER_NAME);
+                const { error } = await supabase.from(TABELA_CACHE)
+                    .update({ 
+                        status: "inativo", 
+                        seen_today: false, 
+                        data_ultima_alteracao: agora, 
+                        last_sync: agora 
+                    })
+                    .in("listing_id", loteIds);
+                
+                if (error) throw new Error(`Erro ao inativar lote: ${error.message}`);
             }
             stats.desativados = idsParaInativar.length;
+        } else {
+            console.log("   Nenhum imóvel para inativar.");
         }
         
-        console.log("✅ Sincronização concluída!");
+        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        console.log("✅ SINCRONIZAÇÃO GLOBAL CONCLUÍDA!");
+        console.log(`📊 Total XML: ${stats.totalXml}`);
+        console.log(`✨ Novos/Reativados: ${stats.novos}`);
+        console.log(`🔄 Atualizados: ${stats.atualizados}`);
+        console.log(`🗑️ Inativados: ${stats.desativados}`);
+        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
         await registrarLog(stats);
 
     } catch (error) {
-        console.error("💥 ERRO:", error.message);
+        console.error("💥 ERRO CRÍTICO:", error.message);
         stats.erro = true;
         stats.mensagemErro = error.message;
         await registrarLog(stats);
