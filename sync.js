@@ -10,7 +10,7 @@ const BATCH_SIZE = 50;
 const TABELA_CACHE = "cache_xml_externo";
 const TABELA_LOGS = "import_logs";
 
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY ) {
     console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas.");
     process.exit(1);
 }
@@ -18,6 +18,8 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
     auth: { persistSession: false }
 });
+
+// --- FUNÇÕES AUXILIARES ---
 
 function lerValor(campo) {
     if (campo === undefined || campo === null) return 0;
@@ -75,7 +77,7 @@ function gerarHash(d) {
 }
 
 async function buscarDadosExistentes() {
-    console.log("   Buscando dados existentes...");
+    console.log("   Buscando estado atual do banco de dados...");
     const mapa = new Map();
     let offset = 0;
     const limite = 1000;
@@ -87,17 +89,12 @@ async function buscarDadosExistentes() {
             .eq("xml_provider", PROVIDER_NAME)
             .range(offset, offset + limite - 1);
         
-        if (error) {
-            console.error(`   Erro na busca:`, error.message);
-            throw error;
-        }
-        
+        if (error) throw error;
         if (!data || data.length === 0) break;
         
         data.forEach(item => {
             mapa.set(String(item.listing_id).trim(), {
                 hash: item.data_hash || "",
-                provider: item.xml_provider,
                 status: item.status
             });
         });
@@ -105,8 +102,6 @@ async function buscarDadosExistentes() {
         if (data.length < limite) break;
         offset += limite;
     }
-    
-    console.log(`   ✅ ${mapa.size} registros carregados do provedor ${PROVIDER_NAME}`);
     return mapa;
 }
 
@@ -122,18 +117,16 @@ async function registrarLog(stats) {
             sem_alteracao: stats.semAlteracao,
             mensagem_erro: stats.mensagemErro || null
         });
-        console.log("📝 Log registrado!");
+        console.log("📝 Log de execução registrado.");
     } catch (err) {
         console.error("⚠️ Erro ao salvar log:", err.message);
     }
 }
 
+// --- CORE DA SINCRONIZAÇÃO ---
+
 async function runImport() {
-    console.log("");
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    console.log("🚀 SINCRONIZAÇÃO XML - V8 (FINAL)");
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    
+    console.log("\n🚀 INICIANDO SINCRONIZAÇÃO DEFINITIVA");
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
 
     try {
@@ -152,6 +145,7 @@ async function runImport() {
         const idsNoXml = new Set();
         const agora = new Date().toISOString();
         
+        console.log(`🔄 Processando ${listings.length} imóveis...`);
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
             const upsertData = [];
@@ -165,19 +159,16 @@ async function runImport() {
                 const location = item.Location || {};
                 const transacao = lerTexto(item.TransactionType);
                 
-                let vVenda = 0, vAluguel = 0;
-                const pVenda = lerValor(details.ListPrice);
-                const pAluguel = lerValor(details.RentalPrice);
-                if (transacao === "For Rent") vAluguel = pAluguel || pVenda;
-                else if (transacao === "For Sale") vVenda = pVenda;
-                else { vVenda = pVenda; vAluguel = pAluguel; }
-
+                // Preços e Mídia
+                let vVenda = lerValor(details.ListPrice);
+                let vAluguel = lerValor(details.RentalPrice);
+                
                 let mediaItems = item.Media?.Item ? (Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item]) : [];
                 let fotos = [];
                 let capa = null;
                 mediaItems.forEach(m => {
                     const url = lerTexto(m);
-                    if (url && url.startsWith("http")) {
+                    if (url && url.startsWith("http" )) {
                         if ((m["@_primary"] === "true" || m["@_primary"] === true) && !capa) capa = url;
                         else fotos.push(url);
                     }
@@ -189,7 +180,7 @@ async function runImport() {
                     titulo: lerTexto(item.Title),
                     tipo: lerTexto(details.PropertyType),
                     finalidade: transacao,
-                    status: "ativo",
+                    status: "ativo", // REGRA: Se está no XML, é ATIVO
                     endereco: lerTexto(location.Address),
                     cidade: lerTexto(location.City)?.toUpperCase() || null,
                     bairro: lerTexto(location.Neighborhood),
@@ -239,8 +230,8 @@ async function runImport() {
             }
         }
 
-        console.log("🗑️ Processando inativações...");
-        // Identificamos quem está ativo no banco mas NÃO está no XML atual
+        // --- INATIVAÇÃO DE AUSENTES ---
+        console.log("🗑️ Verificando imóveis para inativação...");
         const idsParaInativar = [];
         for (const [listing_id, info] of dadosExistentes.entries()) {
             if (info.status === "ativo" && !idsNoXml.has(listing_id)) {
@@ -250,24 +241,17 @@ async function runImport() {
 
         if (idsParaInativar.length > 0) {
             console.log(`   Inativando ${idsParaInativar.length} imóveis ausentes no XML...`);
-            
-            // Processamos em lotes para evitar limites de URL/Payload do Supabase
             for (let i = 0; i < idsParaInativar.length; i += BATCH_SIZE) {
                 const loteIds = idsParaInativar.slice(i, i + BATCH_SIZE);
-                const { error } = await supabase
-                    .from(TABELA_CACHE)
-                    .update({ status: "inativo", seen_today: false, data_ultima_alteracao: agora })
+                await supabase.from(TABELA_CACHE)
+                    .update({ status: "inativo", seen_today: false, data_ultima_alteracao: agora, last_sync: agora })
                     .in("listing_id", loteIds)
                     .eq("xml_provider", PROVIDER_NAME);
-                
-                if (error) throw new Error(`Erro ao inativar lote: ${error.message}`);
             }
             stats.desativados = idsParaInativar.length;
-        } else {
-            console.log("   Nenhum imóvel para inativar.");
         }
         
-        console.log("✅ CONCLUÍDO!");
+        console.log("✅ Sincronização concluída!");
         await registrarLog(stats);
 
     } catch (error) {
