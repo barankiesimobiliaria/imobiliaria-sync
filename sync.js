@@ -1,14 +1,12 @@
-require("dotenv").config();
-const { createClient } = require("@supabase/supabase-js");
-const axios = require("axios");
-const { XMLParser } = require("fast-xml-parser");
-const crypto = require("crypto");
+require('dotenv').config();
+const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
+const { XMLParser } = require('fast-xml-parser');
+const crypto = require('crypto');
 
-const XML_URL = "https://redeurbana.com.br/imoveis/rede/2e2b5834-643b-49c1-8289-005b800168e9";
-const PROVIDER_NAME = "RedeUrbana";
+const XML_URL = 'https://redeurbana.com.br/imoveis/rede/2e2b5834-643b-49c1-8289-005b800168e9';
+const PROVIDER_NAME = 'RedeUrbana';
 const BATCH_SIZE = 50;
-const TABELA_CACHE = "cache_xml_externo";
-const TABELA_LOGS = "import_logs";
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
     console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas.");
@@ -19,101 +17,91 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// --- FUNÇÕES AUXILIARES ---
-
 function lerValor(campo) {
     if (campo === undefined || campo === null) return 0;
-    if (typeof campo === "object") {
-        const valStr = campo["#text"] || campo["text"] || "";
-        const val = parseFloat(valStr);
-        return isNaN(val) ? 0 : val;
-    }
+    if (typeof campo === 'object') return campo['#text'] ? parseFloat(campo['#text']) : 0;
     const val = parseFloat(campo);
     return isNaN(val) ? 0 : val;
 }
 
 function lerTexto(campo) {
-    if (!campo) return "";
-    let texto = "";
-    if (typeof campo === "object") {
-        texto = campo["#text"] || campo["text"] || "";
-    } else {
-        texto = String(campo);
-    }
-    return texto.replace(/\s+/g, " ").trim();
+    if (!campo) return '';
+    if (typeof campo === 'object') return campo['#text'] || '';
+    return String(campo).trim();
 }
 
 function lerFeatures(featuresNode) {
     if (!featuresNode || !featuresNode.Feature) return [];
     const feat = featuresNode.Feature;
     const lista = Array.isArray(feat) ? feat : [feat];
-    return lista.map(f => lerTexto(f)).filter(f => f !== "").sort();
+    return lista.map(f => lerTexto(f)).filter(f => f !== '');
 }
 
 function gerarHash(d) {
-    const normalizarNumero = (n) => {
-        const num = parseFloat(n) || 0;
-        return num.toFixed(2);
-    };
-
     const str = [
-        lerTexto(d.titulo),
-        lerTexto(d.tipo),
-        lerTexto(d.finalidade),
-        lerTexto(d.cidade),
-        lerTexto(d.bairro),
-        lerTexto(d.endereco),
-        String(parseInt(d.quartos) || 0),
-        String(parseInt(d.suites) || 0),
-        String(parseInt(d.banheiros) || 0),
-        String(parseInt(d.vagas_garagem) || 0),
-        normalizarNumero(d.area_total),
-        normalizarNumero(d.area_util),
-        normalizarNumero(d.valor_venda),
-        normalizarNumero(d.valor_aluguel),
-        normalizarNumero(d.valor_condominio),
-        lerTexto(d.descricao).substring(0, 1000),
-        (d.fotos_urls || []).sort().join(","),
-        (d.diferenciais || []).sort().join(",")
-    ].join("|").toLowerCase();
+        d.titulo || '',
+        d.tipo || '',
+        d.finalidade || '',
+        d.cidade || '',
+        d.bairro || '',
+        d.endereco || '',
+        String(d.quartos || 0),
+        String(d.suites || 0),
+        String(d.banheiros || 0),
+        String(d.vagas_garagem || 0),
+        String(d.area_total || 0),
+        String(d.area_util || 0),
+        String(d.valor_venda || 0),
+        String(d.valor_aluguel || 0),
+        String(d.valor_condominio || 0),
+        d.descricao || '',
+        JSON.stringify(d.fotos_urls || [])
+    ].join('|');
     
-    return crypto.createHash("md5").update(str).digest("hex");
+    return crypto.createHash('md5').update(str).digest('hex');
 }
 
-async function buscarDadosExistentes() {
-    console.log("   Buscando registros do banco...");
+async function buscarHashesExistentes() {
+    console.log('   Buscando hashes existentes...');
     const mapa = new Map();
     let offset = 0;
     const limite = 1000;
+    let totalBuscado = 0;
     
     while (true) {
         const { data, error } = await supabase
-            .from(TABELA_CACHE)
-            .select("listing_id, data_hash, status") 
+            .from('cache_xml_externo')
+            .select('listing_id, data_hash')
+            .eq('xml_provider', PROVIDER_NAME)
+            .order('listing_id')
             .range(offset, offset + limite - 1);
         
-        if (error) throw error;
+        if (error) {
+            console.error(`   Erro na busca offset ${offset}:`, error.message);
+            break;
+        }
+        
         if (!data || data.length === 0) break;
         
         data.forEach(item => {
-            mapa.set(String(item.listing_id).trim(), {
-                hash: item.data_hash || "",
-                status: item.status
-            });
+            mapa.set(item.listing_id, item.data_hash || '');
         });
+        
+        totalBuscado += data.length;
         
         if (data.length < limite) break;
         offset += limite;
     }
-    console.log(`   ✅ ${mapa.size} registros carregados do banco.`);
+    
+    console.log(`   ✅ ${totalBuscado} registros encontrados`);
     return mapa;
 }
 
 async function registrarLog(stats) {
     try {
-        await supabase.from(TABELA_LOGS).insert({
+        await supabase.from('import_logs').insert({
             data_execucao: new Date().toISOString(),
-            status: stats.erro ? "erro" : "sucesso",
+            status: stats.erro ? 'erro' : 'sucesso',
             total_xml: stats.totalXml,
             novos: stats.novos,
             atualizados: stats.atualizados,
@@ -121,75 +109,103 @@ async function registrarLog(stats) {
             sem_alteracao: stats.semAlteracao,
             mensagem_erro: stats.mensagemErro || null
         });
+        console.log('📝 Log registrado!');
     } catch (err) {
-        console.error("⚠️ Erro ao salvar log:", err.message);
+        console.error('⚠️ Erro ao salvar log:', err.message);
     }
 }
 
-// --- CORE DA SINCRONIZAÇÃO ---
-
 async function runImport() {
-    console.log("\n🚀 INICIANDO SINCRONIZAÇÃO");
-    let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
+    console.log('');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('🚀 SINCRONIZAÇÃO XML - v3.1');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    
+    let stats = { 
+        totalXml: 0, 
+        novos: 0, 
+        atualizados: 0, 
+        semAlteracao: 0,
+        desativados: 0,
+        erro: false,
+        mensagemErro: null
+    };
 
     try {
-        const dadosExistentes = await buscarDadosExistentes();
+        // PASSO 1: Buscar hashes existentes
+        console.log('');
+        console.log('📦 Passo 1: Buscando dados existentes...');
+        const hashesExistentes = await buscarHashesExistentes();
+        console.log(`   ✅ ${hashesExistentes.size} imóveis no banco`);
 
-        console.log(`📥 Baixando XML...`);
+        // PASSO 2: Resetar flags
+        console.log('');
+        console.log('🔄 Passo 2: Resetando flags...');
+        await supabase
+            .from('cache_xml_externo')
+            .update({ seen_today: false })
+            .eq('xml_provider', PROVIDER_NAME);
+        console.log('   ✅ Flags resetadas');
+
+        // PASSO 3: Baixar XML
+        console.log('');
+        console.log('📥 Passo 3: Baixando XML...');
         const response = await axios.get(XML_URL, { 
-            headers: { 'Cache-Control': 'no-cache' },
+            timeout: 120000,
             responseType: 'text'
         });
         
-        // Configuração ultra-robusta do parser
         const parser = new XMLParser({ 
             ignoreAttributes: false, 
-            attributeNamePrefix: "@_",
-            processEntities: true,
-            trimValues: true,
-            parseTagValue: false, // Evita que o parser tente adivinhar tipos e mude os IDs
-            cdataPropName: "__cdata"
+            attributeNamePrefix: "@_"
         });
         const jsonData = parser.parse(response.data);
         
         const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
-        if (!listingsRaw) throw new Error("Estrutura do XML não reconhecida.");
+        if (!listingsRaw) throw new Error("XML vazio ou inválido");
         
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
+        console.log(`   ✅ ${stats.totalXml} imóveis no XML`);
 
-        const idsNoXml = new Set();
-        const agora = new Date().toISOString();
+        // PASSO 4: Processar
+        console.log('');
+        console.log('⚙️ Passo 4: Processando...');
         
-        console.log(`🔄 Processando ${listings.length} imóveis do XML...`);
+        const idsProcessados = new Set();
+        const agora = new Date().toISOString();
         
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
             const upsertData = [];
             
             for (const item of batch) {
-                // Tenta ler o ID de várias formas possíveis para garantir
-                let listing_id = lerTexto(item.ListingID);
-                if (!listing_id && item.ListingID?.__cdata) listing_id = lerTexto(item.ListingID.__cdata);
-                
-                if (!listing_id) continue;
-                idsNoXml.add(listing_id);
+                const listing_id = lerTexto(item.ListingID);
+                if (!listing_id || idsProcessados.has(listing_id)) continue;
+                idsProcessados.add(listing_id);
 
                 const details = item.Details || {};
                 const location = item.Location || {};
+                const transacao = lerTexto(item.TransactionType);
                 
-                let mediaItems = [];
-                if (item.Media && item.Media.Item) {
-                    mediaItems = Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item];
-                }
+                let vVenda = 0, vAluguel = 0;
+                const pVenda = lerValor(details.ListPrice);
+                const pAluguel = lerValor(details.RentalPrice);
                 
+                if (transacao === 'For Rent') vAluguel = pAluguel || pVenda;
+                else if (transacao === 'For Sale') vVenda = pVenda;
+                else { vVenda = pVenda; vAluguel = pAluguel; }
+
+                let mediaItems = item.Media?.Item 
+                    ? (Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item]) 
+                    : [];
                 let fotos = [];
                 let capa = null;
+                
                 mediaItems.forEach(m => {
                     const url = lerTexto(m);
-                    if (url && url.startsWith("http")) {
-                        const isPrimary = m["@_primary"] === "true" || m["@_primary"] === true;
-                        if (isPrimary && !capa) capa = url;
+                    if (url && url.startsWith('http')) {
+                        if ((m['@_primary'] === 'true' || m['@_primary'] === true) && !capa) capa = url;
                         else fotos.push(url);
                     }
                 });
@@ -197,27 +213,27 @@ async function runImport() {
 
                 const dadosImovel = {
                     listing_id,
-                    titulo: lerTexto(item.Title || item.Title?.__cdata),
+                    titulo: lerTexto(item.Title),
                     tipo: lerTexto(details.PropertyType),
-                    finalidade: lerTexto(item.TransactionType),
-                    status: "ativo", 
+                    finalidade: transacao,
+                    status: 'ativo',
                     endereco: lerTexto(location.Address),
                     cidade: lerTexto(location.City)?.toUpperCase() || null,
                     bairro: lerTexto(location.Neighborhood),
-                    uf: lerTexto(location.State) || "PR",
+                    uf: lerTexto(location.State) || 'PR',
                     latitude: location.Latitude ? String(location.Latitude) : null,
                     longitude: location.Longitude ? String(location.Longitude) : null,
                     quartos: parseInt(lerValor(details.Bedrooms)) || 0,
                     suites: parseInt(lerValor(details.Suites)) || 0,
                     banheiros: parseInt(lerValor(details.Bathrooms)) || 0,
                     vagas_garagem: parseInt(lerValor(details.Garage)) || 0,
-                    area_total: lerValor(details.LotArea) || lerValor(details.LandArea),
-                    area_util: lerValor(details.LivingArea) || lerValor(details.ConstructedArea),
-                    valor_venda: lerValor(details.ListPrice),
-                    valor_aluguel: lerValor(details.RentalPrice),
+                    area_total: lerValor(details.LotArea),
+                    area_util: lerValor(details.LivingArea),
+                    valor_venda: vVenda,
+                    valor_aluguel: vAluguel,
                     valor_condominio: lerValor(details.PropertyAdministrationFee),
                     iptu: lerValor(details.YearlyTax) || lerValor(details.MonthlyTax),
-                    descricao: lerTexto(details.Description || details.Description?.__cdata),
+                    descricao: lerTexto(details.Description),
                     diferenciais: lerFeatures(details.Features),
                     fotos_urls: fotos,
                     seen_today: true,
@@ -228,56 +244,78 @@ async function runImport() {
                 const hashNovo = gerarHash(dadosImovel);
                 dadosImovel.data_hash = hashNovo;
 
-                const registroAntigo = dadosExistentes.get(listing_id);
+                const hashAntigo = hashesExistentes.get(listing_id);
                 
-                if (!registroAntigo) {
+                if (hashAntigo === undefined) {
+                    // NOVO
                     stats.novos++;
-                    dadosImovel.data_ultima_alteracao = agora;
+                    dadosImovel.data_ultima_alteracao = agora; // Data de criação = data de alteração
                     upsertData.push(dadosImovel);
-                } else if (registroAntigo.hash !== hashNovo || registroAntigo.status !== "ativo") {
+                } else if (hashAntigo !== hashNovo) {
+                    // ATUALIZADO - hash diferente, houve mudança real
                     stats.atualizados++;
-                    dadosImovel.data_ultima_alteracao = agora;
+                    dadosImovel.data_ultima_alteracao = agora; // Atualiza data de alteração
                     upsertData.push(dadosImovel);
                 } else {
+                    // SEM ALTERAÇÃO - só atualiza flags (NÃO atualiza data_ultima_alteracao)
                     stats.semAlteracao++;
-                    upsertData.push({ listing_id, seen_today: true, last_sync: agora, status: "ativo" });
+                    upsertData.push({
+                        listing_id,
+                        seen_today: true,
+                        last_sync: agora,
+                        status: 'ativo'
+                    });
                 }
             }
 
             if (upsertData.length > 0) {
-                const { error } = await supabase.from(TABELA_CACHE).upsert(upsertData, { onConflict: "listing_id" });
-                if (error) throw new Error(`Erro no upsert: ${error.message}`);
+                const { error } = await supabase
+                    .from('cache_xml_externo')
+                    .upsert(upsertData, { onConflict: 'listing_id' });
+                    
+                if (error) {
+                    console.error(`   ❌ Erro batch: ${error.message}`);
+                }
+            }
+            
+            if ((i + BATCH_SIZE) % 200 === 0 || i + BATCH_SIZE >= listings.length) {
+                console.log(`   📊 ${Math.min(i + BATCH_SIZE, listings.length)}/${listings.length}`);
             }
         }
 
-        // --- INATIVAÇÃO ---
-        console.log("🗑️ Verificando inativações...");
-        const idsParaInativar = [];
-        for (const [listing_id, info] of dadosExistentes.entries()) {
-            if (info.status === "ativo" && !idsNoXml.has(listing_id)) {
-                idsParaInativar.push(listing_id);
-            }
-        }
-
-        if (idsParaInativar.length > 0) {
-            console.log(`   Inativando ${idsParaInativar.length} imóveis...`);
-            for (let i = 0; i < idsParaInativar.length; i += BATCH_SIZE) {
-                const loteIds = idsParaInativar.slice(i, i + BATCH_SIZE);
-                await supabase.from(TABELA_CACHE)
-                    .update({ status: "inativo", seen_today: false, data_ultima_alteracao: agora, last_sync: agora })
-                    .in("listing_id", loteIds);
-            }
-            stats.desativados = idsParaInativar.length;
+        // PASSO 5: Inativar removidos
+        console.log('');
+        console.log('🗑️ Passo 5: Inativando removidos...');
+        
+        const { data: paraDesativar } = await supabase
+            .from('cache_xml_externo')
+            .select('listing_id')
+            .match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
+        
+        if (paraDesativar && paraDesativar.length > 0) {
+            await supabase
+                .from('cache_xml_externo')
+                .update({ status: 'inativo' })
+                .match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
+            stats.desativados = paraDesativar.length;
         }
         
-        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        console.log(`✅ CONCLUÍDO! XML: ${stats.totalXml} | Inativados: ${stats.desativados}`);
-        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        // RESULTADO
+        console.log('');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log('✅ SINCRONIZAÇÃO CONCLUÍDA!');
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log(`   📄 Total XML:       ${stats.totalXml}`);
+        console.log(`   🆕 Novos:           ${stats.novos}`);
+        console.log(`   🔄 Atualizados:     ${stats.atualizados}`);
+        console.log(`   ✨ Sem alteração:   ${stats.semAlteracao}`);
+        console.log(`   ❌ Removidos:       ${stats.desativados}`);
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
         await registrarLog(stats);
 
     } catch (error) {
-        console.error("💥 ERRO:", error.message);
+        console.error('💥 ERRO:', error.message);
         stats.erro = true;
         stats.mensagemErro = error.message;
         await registrarLog(stats);
