@@ -23,7 +23,6 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 function lerValor(campo) {
     if (campo === undefined || campo === null) return 0;
-    // Se for um objeto (como <Price currency="BRL">100</Price>), tenta pegar o texto
     if (typeof campo === "object") {
         const valStr = campo["#text"] || campo["text"] || "";
         const val = parseFloat(valStr);
@@ -41,7 +40,6 @@ function lerTexto(campo) {
     } else {
         texto = String(campo);
     }
-    // Remove caracteres não imprimíveis e espaços extras, mas preserva acentuação comum em PT-BR
     return texto.replace(/\s+/g, " ").trim();
 }
 
@@ -74,7 +72,6 @@ function gerarHash(d) {
         normalizarNumero(d.valor_venda),
         normalizarNumero(d.valor_aluguel),
         normalizarNumero(d.valor_condominio),
-        // Pegamos um pedaço maior da descrição para o hash ser mais preciso
         lerTexto(d.descricao).substring(0, 1000),
         (d.fotos_urls || []).sort().join(","),
         (d.diferenciais || []).sort().join(",")
@@ -84,7 +81,7 @@ function gerarHash(d) {
 }
 
 async function buscarDadosExistentes() {
-    console.log("   Buscando TODOS os imóveis do banco (Sincronia Global)...");
+    console.log("   Buscando registros do banco...");
     const mapa = new Map();
     let offset = 0;
     const limite = 1000;
@@ -92,7 +89,7 @@ async function buscarDadosExistentes() {
     while (true) {
         const { data, error } = await supabase
             .from(TABELA_CACHE)
-            .select("listing_id, data_hash, xml_provider, status") 
+            .select("listing_id, data_hash, status") 
             .range(offset, offset + limite - 1);
         
         if (error) throw error;
@@ -101,15 +98,14 @@ async function buscarDadosExistentes() {
         data.forEach(item => {
             mapa.set(String(item.listing_id).trim(), {
                 hash: item.data_hash || "",
-                status: item.status,
-                provider: item.xml_provider
+                status: item.status
             });
         });
         
         if (data.length < limite) break;
         offset += limite;
     }
-    console.log(`   ✅ ${mapa.size} registros totais carregados do banco.`);
+    console.log(`   ✅ ${mapa.size} registros carregados do banco.`);
     return mapa;
 }
 
@@ -125,7 +121,6 @@ async function registrarLog(stats) {
             sem_alteracao: stats.semAlteracao,
             mensagem_erro: stats.mensagemErro || null
         });
-        console.log("📝 Log de execução registrado.");
     } catch (err) {
         console.error("⚠️ Erro ao salvar log:", err.message);
     }
@@ -134,29 +129,31 @@ async function registrarLog(stats) {
 // --- CORE DA SINCRONIZAÇÃO ---
 
 async function runImport() {
-    console.log("\n🚀 INICIANDO SINCRONIZAÇÃO GLOBAL CORRIGIDA");
+    console.log("\n🚀 INICIANDO SINCRONIZAÇÃO");
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
 
     try {
         const dadosExistentes = await buscarDadosExistentes();
 
-        console.log(`📥 Baixando XML de: ${XML_URL}`);
+        console.log(`📥 Baixando XML...`);
         const response = await axios.get(XML_URL, { 
             headers: { 'Cache-Control': 'no-cache' },
-            responseType: 'text' // Garante que recebemos como string para o parser
+            responseType: 'text'
         });
         
+        // Configuração ultra-robusta do parser
         const parser = new XMLParser({ 
             ignoreAttributes: false, 
             attributeNamePrefix: "@_",
             processEntities: true,
-            trimValues: true
+            trimValues: true,
+            parseTagValue: false, // Evita que o parser tente adivinhar tipos e mude os IDs
+            cdataPropName: "__cdata"
         });
         const jsonData = parser.parse(response.data);
         
-        // Caminho correto no XML do VivaReal/VRSync
         const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
-        if (!listingsRaw) throw new Error("XML vazio ou estrutura 'ListingDataFeed > Listings > Listing' não encontrada");
+        if (!listingsRaw) throw new Error("Estrutura do XML não reconhecida.");
         
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
@@ -171,21 +168,16 @@ async function runImport() {
             const upsertData = [];
             
             for (const item of batch) {
-                const listing_id = lerTexto(item.ListingID);
-                if (!listing_id) continue;
+                // Tenta ler o ID de várias formas possíveis para garantir
+                let listing_id = lerTexto(item.ListingID);
+                if (!listing_id && item.ListingID?.__cdata) listing_id = lerTexto(item.ListingID.__cdata);
                 
-                // Evita duplicados dentro do próprio XML
-                if (idsNoXml.has(listing_id)) continue;
+                if (!listing_id) continue;
                 idsNoXml.add(listing_id);
 
                 const details = item.Details || {};
                 const location = item.Location || {};
-                const transacao = lerTexto(item.TransactionType);
                 
-                let vVenda = lerValor(details.ListPrice);
-                let vAluguel = lerValor(details.RentalPrice);
-                
-                // Processamento de Fotos
                 let mediaItems = [];
                 if (item.Media && item.Media.Item) {
                     mediaItems = Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item];
@@ -196,23 +188,19 @@ async function runImport() {
                 mediaItems.forEach(m => {
                     const url = lerTexto(m);
                     if (url && url.startsWith("http")) {
-                        // Verifica se é a imagem principal
                         const isPrimary = m["@_primary"] === "true" || m["@_primary"] === true;
-                        if (isPrimary && !capa) {
-                            capa = url;
-                        } else {
-                            fotos.push(url);
-                        }
+                        if (isPrimary && !capa) capa = url;
+                        else fotos.push(url);
                     }
                 });
                 if (capa) fotos.unshift(capa);
 
                 const dadosImovel = {
                     listing_id,
-                    titulo: lerTexto(item.Title),
+                    titulo: lerTexto(item.Title || item.Title?.__cdata),
                     tipo: lerTexto(details.PropertyType),
-                    finalidade: transacao,
-                    status: "ativo", // REGRA: Se está no XML, deve estar ATIVO
+                    finalidade: lerTexto(item.TransactionType),
+                    status: "ativo", 
                     endereco: lerTexto(location.Address),
                     cidade: lerTexto(location.City)?.toUpperCase() || null,
                     bairro: lerTexto(location.Neighborhood),
@@ -225,11 +213,11 @@ async function runImport() {
                     vagas_garagem: parseInt(lerValor(details.Garage)) || 0,
                     area_total: lerValor(details.LotArea) || lerValor(details.LandArea),
                     area_util: lerValor(details.LivingArea) || lerValor(details.ConstructedArea),
-                    valor_venda: vVenda,
-                    valor_aluguel: vAluguel,
+                    valor_venda: lerValor(details.ListPrice),
+                    valor_aluguel: lerValor(details.RentalPrice),
                     valor_condominio: lerValor(details.PropertyAdministrationFee),
                     iptu: lerValor(details.YearlyTax) || lerValor(details.MonthlyTax),
-                    descricao: lerTexto(details.Description),
+                    descricao: lerTexto(details.Description || details.Description?.__cdata),
                     diferenciais: lerFeatures(details.Features),
                     fotos_urls: fotos,
                     seen_today: true,
@@ -243,24 +231,16 @@ async function runImport() {
                 const registroAntigo = dadosExistentes.get(listing_id);
                 
                 if (!registroAntigo) {
-                    // Imóvel novo no banco
                     stats.novos++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
                 } else if (registroAntigo.hash !== hashNovo || registroAntigo.status !== "ativo") {
-                    // Imóvel mudou ou estava inativo e agora está no XML (reativar)
                     stats.atualizados++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
                 } else {
-                    // Nenhuma mudança relevante, apenas atualiza timestamp de visto
                     stats.semAlteracao++;
-                    upsertData.push({ 
-                        listing_id, 
-                        seen_today: true, 
-                        last_sync: agora, 
-                        status: "ativo" 
-                    });
+                    upsertData.push({ listing_id, seen_today: true, last_sync: agora, status: "ativo" });
                 }
             }
 
@@ -270,11 +250,10 @@ async function runImport() {
             }
         }
 
-        // --- INATIVAÇÃO DE AUSENTES ---
-        console.log("🗑️ Verificando imóveis para inativação (não estão no XML)...");
+        // --- INATIVAÇÃO ---
+        console.log("🗑️ Verificando inativações...");
         const idsParaInativar = [];
         for (const [listing_id, info] of dadosExistentes.entries()) {
-            // Se o imóvel está ativo no banco mas NÃO está no conjunto de IDs que acabamos de ler do XML
             if (info.status === "ativo" && !idsNoXml.has(listing_id)) {
                 idsParaInativar.push(listing_id);
             }
@@ -284,35 +263,21 @@ async function runImport() {
             console.log(`   Inativando ${idsParaInativar.length} imóveis...`);
             for (let i = 0; i < idsParaInativar.length; i += BATCH_SIZE) {
                 const loteIds = idsParaInativar.slice(i, i + BATCH_SIZE);
-                const { error } = await supabase.from(TABELA_CACHE)
-                    .update({ 
-                        status: "inativo", 
-                        seen_today: false, 
-                        data_ultima_alteracao: agora, 
-                        last_sync: agora 
-                    })
+                await supabase.from(TABELA_CACHE)
+                    .update({ status: "inativo", seen_today: false, data_ultima_alteracao: agora, last_sync: agora })
                     .in("listing_id", loteIds);
-                
-                if (error) throw new Error(`Erro ao inativar lote: ${error.message}`);
             }
             stats.desativados = idsParaInativar.length;
-        } else {
-            console.log("   Nenhum imóvel para inativar.");
         }
         
         console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        console.log("✅ SINCRONIZAÇÃO CONCLUÍDA COM SUCESSO!");
-        console.log(`📊 Total no XML: ${stats.totalXml}`);
-        console.log(`✨ Novos/Reativados: ${stats.novos}`);
-        console.log(`🔄 Atualizados: ${stats.atualizados}`);
-        console.log(`🗑️ Inativados: ${stats.desativados}`);
-        console.log(`✔️ Sem alteração: ${stats.semAlteracao}`);
+        console.log(`✅ CONCLUÍDO! XML: ${stats.totalXml} | Inativados: ${stats.desativados}`);
         console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
         await registrarLog(stats);
 
     } catch (error) {
-        console.error("💥 ERRO CRÍTICO:", error.message);
+        console.error("💥 ERRO:", error.message);
         stats.erro = true;
         stats.mensagemErro = error.message;
         await registrarLog(stats);
