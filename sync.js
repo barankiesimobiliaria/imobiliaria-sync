@@ -23,7 +23,12 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 function lerValor(campo) {
     if (campo === undefined || campo === null) return 0;
-    if (typeof campo === "object") return campo["#text"] ? parseFloat(campo["#text"]) : 0;
+    // Se for um objeto (como <Price currency="BRL">100</Price>), tenta pegar o texto
+    if (typeof campo === "object") {
+        const valStr = campo["#text"] || campo["text"] || "";
+        const val = parseFloat(valStr);
+        return isNaN(val) ? 0 : val;
+    }
     const val = parseFloat(campo);
     return isNaN(val) ? 0 : val;
 }
@@ -32,11 +37,12 @@ function lerTexto(campo) {
     if (!campo) return "";
     let texto = "";
     if (typeof campo === "object") {
-        texto = campo["#text"] || "";
+        texto = campo["#text"] || campo["text"] || "";
     } else {
         texto = String(campo);
     }
-    return texto.replace(/\s+/g, " ").replace(/[^\x20-\x7E]/g, "").trim();
+    // Remove caracteres não imprimíveis e espaços extras, mas preserva acentuação comum em PT-BR
+    return texto.replace(/\s+/g, " ").trim();
 }
 
 function lerFeatures(featuresNode) {
@@ -68,7 +74,8 @@ function gerarHash(d) {
         normalizarNumero(d.valor_venda),
         normalizarNumero(d.valor_aluguel),
         normalizarNumero(d.valor_condominio),
-        lerTexto(d.descricao).substring(0, 500).replace(/[^a-zA-Z0-9 ]/g, ""),
+        // Pegamos um pedaço maior da descrição para o hash ser mais preciso
+        lerTexto(d.descricao).substring(0, 1000),
         (d.fotos_urls || []).sort().join(","),
         (d.diferenciais || []).sort().join(",")
     ].join("|").toLowerCase();
@@ -83,7 +90,6 @@ async function buscarDadosExistentes() {
     const limite = 1000;
     
     while (true) {
-        // REMOVIDO FILTRO DE PROVEDOR PARA GARANTIR QUE ENCONTRAMOS TUDO
         const { data, error } = await supabase
             .from(TABELA_CACHE)
             .select("listing_id, data_hash, xml_provider, status") 
@@ -128,21 +134,30 @@ async function registrarLog(stats) {
 // --- CORE DA SINCRONIZAÇÃO ---
 
 async function runImport() {
-    console.log("\n🚀 INICIANDO SINCRONIZAÇÃO GLOBAL DEFINITIVA");
+    console.log("\n🚀 INICIANDO SINCRONIZAÇÃO GLOBAL CORRIGIDA");
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
 
     try {
         const dadosExistentes = await buscarDadosExistentes();
 
         console.log(`📥 Baixando XML de: ${XML_URL}`);
-        const response = await axios.get(XML_URL, { headers: { 'Cache-Control': 'no-cache' } });
-        console.log(`   Tamanho do XML: ${(response.data.length / 1024 / 1024).toFixed(2)} MB`);
+        const response = await axios.get(XML_URL, { 
+            headers: { 'Cache-Control': 'no-cache' },
+            responseType: 'text' // Garante que recebemos como string para o parser
+        });
         
-        const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+        const parser = new XMLParser({ 
+            ignoreAttributes: false, 
+            attributeNamePrefix: "@_",
+            processEntities: true,
+            trimValues: true
+        });
         const jsonData = parser.parse(response.data);
         
+        // Caminho correto no XML do VivaReal/VRSync
         const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
-        if (!listingsRaw) throw new Error("XML vazio ou inválido");
+        if (!listingsRaw) throw new Error("XML vazio ou estrutura 'ListingDataFeed > Listings > Listing' não encontrada");
+        
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
 
@@ -150,13 +165,17 @@ async function runImport() {
         const agora = new Date().toISOString();
         
         console.log(`🔄 Processando ${listings.length} imóveis do XML...`);
+        
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
             const upsertData = [];
             
             for (const item of batch) {
                 const listing_id = lerTexto(item.ListingID);
-                if (!listing_id || idsNoXml.has(listing_id)) continue;
+                if (!listing_id) continue;
+                
+                // Evita duplicados dentro do próprio XML
+                if (idsNoXml.has(listing_id)) continue;
                 idsNoXml.add(listing_id);
 
                 const details = item.Details || {};
@@ -166,14 +185,24 @@ async function runImport() {
                 let vVenda = lerValor(details.ListPrice);
                 let vAluguel = lerValor(details.RentalPrice);
                 
-                let mediaItems = item.Media?.Item ? (Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item]) : [];
+                // Processamento de Fotos
+                let mediaItems = [];
+                if (item.Media && item.Media.Item) {
+                    mediaItems = Array.isArray(item.Media.Item) ? item.Media.Item : [item.Media.Item];
+                }
+                
                 let fotos = [];
                 let capa = null;
                 mediaItems.forEach(m => {
                     const url = lerTexto(m);
                     if (url && url.startsWith("http")) {
-                        if ((m["@_primary"] === "true" || m["@_primary"] === true) && !capa) capa = url;
-                        else fotos.push(url);
+                        // Verifica se é a imagem principal
+                        const isPrimary = m["@_primary"] === "true" || m["@_primary"] === true;
+                        if (isPrimary && !capa) {
+                            capa = url;
+                        } else {
+                            fotos.push(url);
+                        }
                     }
                 });
                 if (capa) fotos.unshift(capa);
@@ -183,7 +212,7 @@ async function runImport() {
                     titulo: lerTexto(item.Title),
                     tipo: lerTexto(details.PropertyType),
                     finalidade: transacao,
-                    status: "ativo", // REGRA: Se está no XML, é ATIVO
+                    status: "ativo", // REGRA: Se está no XML, deve estar ATIVO
                     endereco: lerTexto(location.Address),
                     cidade: lerTexto(location.City)?.toUpperCase() || null,
                     bairro: lerTexto(location.Neighborhood),
@@ -194,8 +223,8 @@ async function runImport() {
                     suites: parseInt(lerValor(details.Suites)) || 0,
                     banheiros: parseInt(lerValor(details.Bathrooms)) || 0,
                     vagas_garagem: parseInt(lerValor(details.Garage)) || 0,
-                    area_total: lerValor(details.LotArea),
-                    area_util: lerValor(details.LivingArea),
+                    area_total: lerValor(details.LotArea) || lerValor(details.LandArea),
+                    area_util: lerValor(details.LivingArea) || lerValor(details.ConstructedArea),
                     valor_venda: vVenda,
                     valor_aluguel: vAluguel,
                     valor_condominio: lerValor(details.PropertyAdministrationFee),
@@ -214,16 +243,24 @@ async function runImport() {
                 const registroAntigo = dadosExistentes.get(listing_id);
                 
                 if (!registroAntigo) {
+                    // Imóvel novo no banco
                     stats.novos++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
                 } else if (registroAntigo.hash !== hashNovo || registroAntigo.status !== "ativo") {
+                    // Imóvel mudou ou estava inativo e agora está no XML (reativar)
                     stats.atualizados++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
                 } else {
+                    // Nenhuma mudança relevante, apenas atualiza timestamp de visto
                     stats.semAlteracao++;
-                    upsertData.push({ listing_id, seen_today: true, last_sync: agora, status: "ativo" });
+                    upsertData.push({ 
+                        listing_id, 
+                        seen_today: true, 
+                        last_sync: agora, 
+                        status: "ativo" 
+                    });
                 }
             }
 
@@ -233,19 +270,18 @@ async function runImport() {
             }
         }
 
-        // --- INATIVAÇÃO DE AUSENTES (Lógica Global) ---
-        console.log("🗑️ Verificando imóveis para inativação compulsória...");
+        // --- INATIVAÇÃO DE AUSENTES ---
+        console.log("🗑️ Verificando imóveis para inativação (não estão no XML)...");
         const idsParaInativar = [];
         for (const [listing_id, info] of dadosExistentes.entries()) {
-            // Se o imóvel está ativo no banco mas NÃO veio no XML atual, inativamos.
-            // Note que agora olhamos para TODOS os imóveis do banco, independente do provedor original.
+            // Se o imóvel está ativo no banco mas NÃO está no conjunto de IDs que acabamos de ler do XML
             if (info.status === "ativo" && !idsNoXml.has(listing_id)) {
                 idsParaInativar.push(listing_id);
             }
         }
 
         if (idsParaInativar.length > 0) {
-            console.log(`   Inativando ${idsParaInativar.length} imóveis ausentes no XML...`);
+            console.log(`   Inativando ${idsParaInativar.length} imóveis...`);
             for (let i = 0; i < idsParaInativar.length; i += BATCH_SIZE) {
                 const loteIds = idsParaInativar.slice(i, i + BATCH_SIZE);
                 const { error } = await supabase.from(TABELA_CACHE)
@@ -265,11 +301,12 @@ async function runImport() {
         }
         
         console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        console.log("✅ SINCRONIZAÇÃO GLOBAL CONCLUÍDA!");
-        console.log(`📊 Total XML: ${stats.totalXml}`);
+        console.log("✅ SINCRONIZAÇÃO CONCLUÍDA COM SUCESSO!");
+        console.log(`📊 Total no XML: ${stats.totalXml}`);
         console.log(`✨ Novos/Reativados: ${stats.novos}`);
         console.log(`🔄 Atualizados: ${stats.atualizados}`);
         console.log(`🗑️ Inativados: ${stats.desativados}`);
+        console.log(`✔️ Sem alteração: ${stats.semAlteracao}`);
         console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
         await registrarLog(stats);
