@@ -10,6 +10,10 @@ const BATCH_SIZE = 50;
 const TABELA_CACHE = 'cache_xml_externo';
 const TABELA_LOGS = 'import_logs';
 
+// Configurações de Robustez
+const MAX_RETRIES = 3;
+const AXIOS_TIMEOUT = 60000; // 60 segundos para download de arquivos grandes
+
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
     console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas.");
     process.exit(1);
@@ -19,6 +23,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
+// Funções Auxiliares de Leitura
 function lerValor(campo) {
     if (campo === undefined || campo === null) return 0;
     if (typeof campo === 'object') return campo['#text'] ? parseFloat(campo['#text']) : 0;
@@ -36,12 +41,11 @@ function lerFeatures(featuresNode) {
     if (!featuresNode || !featuresNode.Feature) return [];
     const feat = featuresNode.Feature;
     const lista = Array.isArray(feat) ? feat : [feat];
-    return lista.map(f => lerTexto(f)).filter(f => f !== '').sort(); // Sort para estabilidade do hash
+    return lista.map(f => lerTexto(f)).filter(f => f !== '').sort();
 }
 
 /**
  * Gera um Hash robusto focado apenas nos dados vitais.
- * Ignora campos de sistema como datas de sincronização que mudam sempre.
  */
 function gerarHash(d) {
     const str = [
@@ -60,11 +64,33 @@ function gerarHash(d) {
         String(Number(d.valor_venda).toFixed(2)),
         String(Number(d.valor_aluguel).toFixed(2)),
         String(Number(d.valor_condominio).toFixed(2)),
-        lerTexto(d.descricao).substring(0, 500), // Compara apenas o início da descrição para performance
+        lerTexto(d.descricao).substring(0, 500),
         (d.fotos_urls || []).join(',')
-    ].join('|').toLowerCase(); // Case-insensitive para maior estabilidade
+    ].join('|').toLowerCase();
     
     return crypto.createHash('md5').update(str).digest('hex');
+}
+
+/**
+ * Função de download com Retry para evitar falhas de rede
+ */
+async function downloadXML(url, retries = MAX_RETRIES) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            console.log(`📥 Baixando XML (Tentativa ${i + 1}/${retries})...`);
+            const response = await axios.get(url, { 
+                timeout: AXIOS_TIMEOUT,
+                headers: { 'Accept-Encoding': 'gzip, deflate, br' } // Melhora performance de download
+            });
+            if (!response.data) throw new Error("Resposta do servidor vazia");
+            return response.data;
+        } catch (err) {
+            console.error(`⚠️ Falha no download: ${err.message}`);
+            if (i === retries - 1) throw err;
+            const wait = Math.pow(2, i) * 1000; // Exponential backoff
+            await new Promise(res => setTimeout(res, wait));
+        }
+    }
 }
 
 async function buscarDadosExistentes() {
@@ -76,7 +102,7 @@ async function buscarDadosExistentes() {
     while (true) {
         const { data, error } = await supabase
             .from(TABELA_CACHE)
-            .select('listing_id, data_hash, xml_provider') 
+            .select('listing_id, data_hash, xml_provider, status') 
             .range(offset, offset + limite - 1);
         
         if (error) {
@@ -89,7 +115,8 @@ async function buscarDadosExistentes() {
         data.forEach(item => {
             mapa.set(String(item.listing_id).trim(), {
                 hash: item.data_hash || '',
-                provider: item.xml_provider
+                provider: item.xml_provider,
+                status: item.status
             });
         });
         
@@ -122,7 +149,7 @@ async function registrarLog(stats) {
 async function runImport() {
     console.log('');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('🚀 SINCRONIZAÇÃO XML - V5 (ESTÁVEL)');
+    console.log('🚀 SINCRONIZAÇÃO XML OTIMIZADA - V6');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
@@ -130,20 +157,22 @@ async function runImport() {
     try {
         const dadosExistentes = await buscarDadosExistentes();
 
-        console.log('🔄 Resetando flags...');
+        console.log('🔄 Resetando flags de presença...');
+        // Resetamos apenas a flag seen_today, o status permanece até o fim do processo
         await supabase.from(TABELA_CACHE).update({ seen_today: false }).eq('xml_provider', PROVIDER_NAME);
 
-        console.log('📥 Baixando XML...');
-        const response = await axios.get(XML_URL);
+        const xmlData = await downloadXML(XML_URL);
         const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
-        const jsonData = parser.parse(response.data);
+        const jsonData = parser.parse(xmlData);
         
         const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
-        if (!listingsRaw) throw new Error("XML vazio ou inválido");
+        if (!listingsRaw) throw new Error("Estrutura do XML inválida ou sem imóveis");
+        
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
+        console.log(`📦 Processando ${stats.totalXml} imóveis do XML...`);
 
-        const idsProcessados = new Set();
+        const idsProcessadosNoXML = new Set();
         const agora = new Date().toISOString();
         
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
@@ -152,8 +181,8 @@ async function runImport() {
             
             for (const item of batch) {
                 const listing_id = lerTexto(item.ListingID);
-                if (!listing_id || idsProcessados.has(listing_id)) continue;
-                idsProcessados.add(listing_id);
+                if (!listing_id || idsProcessadosNoXML.has(listing_id)) continue;
+                idsProcessadosNoXML.add(listing_id);
 
                 const details = item.Details || {};
                 const location = item.Location || {};
@@ -183,7 +212,7 @@ async function runImport() {
                     titulo: lerTexto(item.Title),
                     tipo: lerTexto(details.PropertyType),
                     finalidade: transacao,
-                    status: 'ativo',
+                    status: 'ativo', // Se está no XML, deve estar ativo
                     endereco: lerTexto(location.Address),
                     cidade: lerTexto(location.City)?.toUpperCase() || null,
                     bairro: lerTexto(location.Neighborhood),
@@ -213,38 +242,48 @@ async function runImport() {
 
                 const registroAntigo = dadosExistentes.get(listing_id);
                 
+                // Lógica de Decisão: Novo, Atualizado ou Sem Alteração
                 if (!registroAntigo) {
                     stats.novos++;
                     dadosImovel.data_ultima_alteracao = agora;
                     upsertData.push(dadosImovel);
-                } else if (registroAntigo.provider !== PROVIDER_NAME || registroAntigo.hash !== hashNovo) {
-                    stats.atualizados++;
-                    dadosImovel.data_ultima_alteracao = agora;
-                    upsertData.push(dadosImovel);
                 } else {
-                    stats.semAlteracao++;
-                    upsertData.push({ listing_id, seen_today: true, last_sync: agora, status: 'ativo' });
+                    const mudouHash = registroAntigo.hash !== hashNovo;
+                    const estavaInativo = registroAntigo.status !== 'ativo';
+                    
+                    if (mudouHash || estavaInativo) {
+                        stats.atualizados++;
+                        dadosImovel.data_ultima_alteracao = agora;
+                        upsertData.push(dadosImovel);
+                    } else {
+                        stats.semAlteracao++;
+                        // Apenas marca como visto e atualiza o last_sync
+                        upsertData.push({ listing_id, seen_today: true, last_sync: agora, status: 'ativo' });
+                    }
                 }
             }
 
             if (upsertData.length > 0) {
                 const { error } = await supabase.from(TABELA_CACHE).upsert(upsertData, { onConflict: 'listing_id' });
-                if (error) throw new Error(`Erro no upsert: ${error.message}`);
+                if (error) throw new Error(`Erro no upsert batch: ${error.message}`);
             }
         }
 
-        console.log('🗑️ Inativando removidos...');
-        const { data: paraDesativar } = await supabase.from(TABELA_CACHE).select('listing_id').match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
-        if (paraDesativar && paraDesativar.length > 0) {
-            await supabase.from(TABELA_CACHE).update({ status: 'inativo', data_ultima_alteracao: agora }).match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
-            stats.desativados = paraDesativar.length;
-        }
+        console.log('🗑️ Inativando imóveis ausentes no XML...');
+        // Inativa quem é do provedor, estava ativo e não foi visto hoje
+        const { error: errorInativar, count: desativadosCount } = await supabase
+            .from(TABELA_CACHE)
+            .update({ status: 'inativo', data_ultima_alteracao: agora })
+            .match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
         
-        console.log('✅ CONCLUÍDO!');
+        if (errorInativar) console.error("⚠️ Erro ao inativar ausentes:", errorInativar.message);
+        stats.desativados = desativadosCount || 0;
+        
+        console.log(`✅ CONCLUÍDO! Novos: ${stats.novos}, Atualizados: ${stats.atualizados}, Inativados: ${stats.desativados}`);
         await registrarLog(stats);
 
     } catch (error) {
-        console.error('💥 ERRO:', error.message);
+        console.error('💥 ERRO FATAL:', error.message);
         stats.erro = true;
         stats.mensagemErro = error.message;
         await registrarLog(stats);
