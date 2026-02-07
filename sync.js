@@ -1,9 +1,15 @@
+/**
+ * SINCRONIZAÇÃO DE IMÓVEIS XML -> SUPABASE
+ * Versão: 7.0 (Foco em Consistência e Desativação Automática)
+ */
+
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 const { XMLParser } = require('fast-xml-parser');
 const crypto = require('crypto');
 
+// Configurações Principais
 const XML_URL = 'https://redeurbana.com.br/imoveis/rede/2e2b5834-643b-49c1-8289-005b800168e9';
 const PROVIDER_NAME = 'RedeUrbana';
 const BATCH_SIZE = 50;
@@ -12,10 +18,10 @@ const TABELA_LOGS = 'import_logs';
 
 // Configurações de Robustez
 const MAX_RETRIES = 3;
-const AXIOS_TIMEOUT = 60000; // 60 segundos para download de arquivos grandes
+const AXIOS_TIMEOUT = 120000; // 2 minutos para garantir downloads grandes
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-    console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas.");
+    console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas no .env");
     process.exit(1);
 }
 
@@ -23,7 +29,8 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
     auth: { persistSession: false }
 });
 
-// Funções Auxiliares de Leitura
+// --- FUNÇÕES AUXILIARES ---
+
 function lerValor(campo) {
     if (campo === undefined || campo === null) return 0;
     if (typeof campo === 'object') return campo['#text'] ? parseFloat(campo['#text']) : 0;
@@ -44,9 +51,6 @@ function lerFeatures(featuresNode) {
     return lista.map(f => lerTexto(f)).filter(f => f !== '').sort();
 }
 
-/**
- * Gera um Hash robusto focado apenas nos dados vitais.
- */
 function gerarHash(d) {
     const str = [
         lerTexto(d.titulo),
@@ -71,30 +75,27 @@ function gerarHash(d) {
     return crypto.createHash('md5').update(str).digest('hex');
 }
 
-/**
- * Função de download com Retry para evitar falhas de rede
- */
 async function downloadXML(url, retries = MAX_RETRIES) {
     for (let i = 0; i < retries; i++) {
         try {
             console.log(`📥 Baixando XML (Tentativa ${i + 1}/${retries})...`);
             const response = await axios.get(url, { 
                 timeout: AXIOS_TIMEOUT,
-                headers: { 'Accept-Encoding': 'gzip, deflate, br' } // Melhora performance de download
+                headers: { 'Accept-Encoding': 'gzip, deflate, br' }
             });
             if (!response.data) throw new Error("Resposta do servidor vazia");
             return response.data;
         } catch (err) {
             console.error(`⚠️ Falha no download: ${err.message}`);
             if (i === retries - 1) throw err;
-            const wait = Math.pow(2, i) * 1000; // Exponential backoff
+            const wait = Math.pow(2, i) * 1000;
             await new Promise(res => setTimeout(res, wait));
         }
     }
 }
 
 async function buscarDadosExistentes() {
-    console.log('   Buscando dados existentes...');
+    console.log('🔍 Carregando IDs e Hashes atuais do banco...');
     const mapa = new Map();
     let offset = 0;
     const limite = 1000;
@@ -102,20 +103,16 @@ async function buscarDadosExistentes() {
     while (true) {
         const { data, error } = await supabase
             .from(TABELA_CACHE)
-            .select('listing_id, data_hash, xml_provider, status') 
+            .select('listing_id, data_hash, status')
+            .eq('xml_provider', PROVIDER_NAME)
             .range(offset, offset + limite - 1);
         
-        if (error) {
-            console.error(`   Erro na busca:`, error.message);
-            throw error;
-        }
-        
+        if (error) throw new Error(`Erro ao buscar dados existentes: ${error.message}`);
         if (!data || data.length === 0) break;
         
         data.forEach(item => {
             mapa.set(String(item.listing_id).trim(), {
                 hash: item.data_hash || '',
-                provider: item.xml_provider,
                 status: item.status
             });
         });
@@ -124,7 +121,7 @@ async function buscarDadosExistentes() {
         offset += limite;
     }
     
-    console.log(`   ✅ ${mapa.size} registros carregados`);
+    console.log(`✅ ${mapa.size} registros carregados para comparação.`);
     return mapa;
 }
 
@@ -140,41 +137,50 @@ async function registrarLog(stats) {
             sem_alteracao: stats.semAlteracao,
             mensagem_erro: stats.mensagemErro || null
         });
-        console.log('📝 Log registrado!');
+        console.log('📝 Log de execução salvo no banco.');
     } catch (err) {
         console.error('⚠️ Erro ao salvar log:', err.message);
     }
 }
 
+// --- PROCESSO PRINCIPAL ---
+
 async function runImport() {
-    console.log('');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('🚀 SINCRONIZAÇÃO XML OTIMIZADA - V6');
+    console.log('🚀 INICIANDO SINCRONIZAÇÃO XML V7.0');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
+    const agora = new Date().toISOString();
 
     try {
+        // 1. Carregar dados atuais
         const dadosExistentes = await buscarDadosExistentes();
 
-        console.log('🔄 Resetando flags de presença...');
-        // Resetamos apenas a flag seen_today, o status permanece até o fim do processo
-        await supabase.from(TABELA_CACHE).update({ seen_today: false }).eq('xml_provider', PROVIDER_NAME);
+        // 2. Resetar flags de presença (Crucial para desativação)
+        console.log('🔄 Resetando flags de presença (seen_today)...');
+        const { error: resetError } = await supabase
+            .from(TABELA_CACHE)
+            .update({ seen_today: false })
+            .eq('xml_provider', PROVIDER_NAME);
+        
+        if (resetError) throw new Error(`Falha ao resetar flags: ${resetError.message}`);
 
+        // 3. Baixar e Parsear XML
         const xmlData = await downloadXML(XML_URL);
         const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
         const jsonData = parser.parse(xmlData);
         
         const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
-        if (!listingsRaw) throw new Error("Estrutura do XML inválida ou sem imóveis");
+        if (!listingsRaw) throw new Error("Estrutura do XML inválida ou vazia");
         
         const listings = Array.isArray(listingsRaw) ? listingsRaw : [listingsRaw];
         stats.totalXml = listings.length;
         console.log(`📦 Processando ${stats.totalXml} imóveis do XML...`);
 
         const idsProcessadosNoXML = new Set();
-        const agora = new Date().toISOString();
         
+        // 4. Processar em Batches
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
             const upsertData = [];
@@ -212,7 +218,7 @@ async function runImport() {
                     titulo: lerTexto(item.Title),
                     tipo: lerTexto(details.PropertyType),
                     finalidade: transacao,
-                    status: 'ativo', // Se está no XML, deve estar ativo
+                    status: 'ativo',
                     endereco: lerTexto(location.Address),
                     cidade: lerTexto(location.City)?.toUpperCase() || null,
                     bairro: lerTexto(location.Neighborhood),
@@ -232,7 +238,7 @@ async function runImport() {
                     descricao: lerTexto(details.Description),
                     diferenciais: lerFeatures(details.Features),
                     fotos_urls: fotos,
-                    seen_today: true,
+                    seen_today: true, // Marca como presente
                     last_sync: agora,
                     xml_provider: PROVIDER_NAME
                 };
@@ -242,7 +248,6 @@ async function runImport() {
 
                 const registroAntigo = dadosExistentes.get(listing_id);
                 
-                // Lógica de Decisão: Novo, Atualizado ou Sem Alteração
                 if (!registroAntigo) {
                     stats.novos++;
                     dadosImovel.data_ultima_alteracao = agora;
@@ -257,29 +262,47 @@ async function runImport() {
                         upsertData.push(dadosImovel);
                     } else {
                         stats.semAlteracao++;
-                        // Apenas marca como visto e atualiza o last_sync
-                        upsertData.push({ listing_id, seen_today: true, last_sync: agora, status: 'ativo' });
+                        // IMPORTANTE: Mesmo sem mudança, enviamos o seen_today: true
+                        upsertData.push({ 
+                            listing_id, 
+                            seen_today: true, 
+                            last_sync: agora, 
+                            status: 'ativo' 
+                        });
                     }
                 }
             }
 
             if (upsertData.length > 0) {
                 const { error } = await supabase.from(TABELA_CACHE).upsert(upsertData, { onConflict: 'listing_id' });
-                if (error) throw new Error(`Erro no upsert batch: ${error.message}`);
+                if (error) throw new Error(`Erro no batch de upsert: ${error.message}`);
             }
         }
 
-        console.log('🗑️ Inativando imóveis ausentes no XML...');
-        // Inativa quem é do provedor, estava ativo e não foi visto hoje
+        // 5. Inativar Imóveis Ausentes
+        console.log('🗑️ Inativando imóveis que não constam mais no XML...');
         const { error: errorInativar, count: desativadosCount } = await supabase
             .from(TABELA_CACHE)
-            .update({ status: 'inativo', data_ultima_alteracao: agora })
-            .match({ xml_provider: PROVIDER_NAME, seen_today: false, status: 'ativo' });
+            .update({ 
+                status: 'inativo', 
+                data_ultima_alteracao: agora 
+            })
+            .eq('xml_provider', PROVIDER_NAME)
+            .eq('seen_today', false)
+            .eq('status', 'ativo')
+            .select('listing_id', { count: 'exact' });
         
-        if (errorInativar) console.error("⚠️ Erro ao inativar ausentes:", errorInativar.message);
+        if (errorInativar) throw new Error(`Erro ao inativar ausentes: ${errorInativar.message}`);
         stats.desativados = desativadosCount || 0;
         
-        console.log(`✅ CONCLUÍDO! Novos: ${stats.novos}, Atualizados: ${stats.atualizados}, Inativados: ${stats.desativados}`);
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+        console.log(`✅ SUCESSO!`);
+        console.log(`   Novos: ${stats.novos}`);
+        console.log(`   Atualizados: ${stats.atualizados}`);
+        console.log(`   Mantidos: ${stats.semAlteracao}`);
+        console.log(`   Inativados: ${stats.desativados}`);
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
         await registrarLog(stats);
 
     } catch (error) {
