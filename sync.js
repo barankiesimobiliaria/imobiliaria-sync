@@ -1,6 +1,12 @@
 /**
  * SINCRONIZAÇÃO DE IMÓVEIS XML -> SUPABASE
- * Versão: 7.0 (Foco em Consistência e Desativação Automática)
+ * Versão: 8.0 (Foco em Confiabilidade e Desativação por Timestamp)
+ * 
+ * MELHORIAS DESTA VERSÃO:
+ * 1. Remoção do reset global (seen_today) para evitar desativações em massa em caso de erro no meio do processo.
+ * 2. Uso de 'last_sync' (timestamp) para identificar imóveis ausentes no XML.
+ * 3. Upsert completo para garantir consistência dos dados.
+ * 4. Tratamento de erros aprimorado.
  */
 
 require('dotenv').config();
@@ -18,7 +24,7 @@ const TABELA_LOGS = 'import_logs';
 
 // Configurações de Robustez
 const MAX_RETRIES = 3;
-const AXIOS_TIMEOUT = 120000; // 2 minutos para garantir downloads grandes
+const AXIOS_TIMEOUT = 120000;
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
     console.error("❌ Erro: SUPABASE_URL ou SUPABASE_KEY não configuradas no .env");
@@ -147,26 +153,18 @@ async function registrarLog(stats) {
 
 async function runImport() {
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('🚀 INICIANDO SINCRONIZAÇÃO XML V7.0');
+    console.log('🚀 INICIANDO SINCRONIZAÇÃO XML V8.0');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     
+    // O 'inicioSincronizacao' é a chave para a desativação correta
+    const inicioSincronizacao = new Date().toISOString();
     let stats = { totalXml: 0, novos: 0, atualizados: 0, semAlteracao: 0, desativados: 0, erro: false, mensagemErro: null };
-    const agora = new Date().toISOString();
 
     try {
-        // 1. Carregar dados atuais
+        // 1. Carregar dados atuais para comparação de Hash
         const dadosExistentes = await buscarDadosExistentes();
 
-        // 2. Resetar flags de presença (Crucial para desativação)
-        console.log('🔄 Resetando flags de presença (seen_today)...');
-        const { error: resetError } = await supabase
-            .from(TABELA_CACHE)
-            .update({ seen_today: false })
-            .eq('xml_provider', PROVIDER_NAME);
-        
-        if (resetError) throw new Error(`Falha ao resetar flags: ${resetError.message}`);
-
-        // 3. Baixar e Parsear XML
+        // 2. Baixar e Parsear XML
         const xmlData = await downloadXML(XML_URL);
         const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
         const jsonData = parser.parse(xmlData);
@@ -180,7 +178,7 @@ async function runImport() {
 
         const idsProcessadosNoXML = new Set();
         
-        // 4. Processar em Batches
+        // 3. Processar em Batches
         for (let i = 0; i < listings.length; i += BATCH_SIZE) {
             const batch = listings.slice(i, i + BATCH_SIZE);
             const upsertData = [];
@@ -238,8 +236,7 @@ async function runImport() {
                     descricao: lerTexto(details.Description),
                     diferenciais: lerFeatures(details.Features),
                     fotos_urls: fotos,
-                    seen_today: true, // Marca como presente
-                    last_sync: agora,
+                    last_sync: inicioSincronizacao, // Marca que este imóvel foi visto NESTA rodada
                     xml_provider: PROVIDER_NAME
                 };
 
@@ -250,7 +247,7 @@ async function runImport() {
                 
                 if (!registroAntigo) {
                     stats.novos++;
-                    dadosImovel.data_ultima_alteracao = agora;
+                    dadosImovel.data_ultima_alteracao = inicioSincronizacao;
                     upsertData.push(dadosImovel);
                 } else {
                     const mudouHash = registroAntigo.hash !== hashNovo;
@@ -258,16 +255,17 @@ async function runImport() {
                     
                     if (mudouHash || estavaInativo) {
                         stats.atualizados++;
-                        dadosImovel.data_ultima_alteracao = agora;
+                        dadosImovel.data_ultima_alteracao = inicioSincronizacao;
                         upsertData.push(dadosImovel);
                     } else {
                         stats.semAlteracao++;
-                        // IMPORTANTE: Mesmo sem mudança, enviamos o seen_today: true
+                        // Mesmo sem alteração de conteúdo, atualizamos o 'last_sync' e o 'status'
+                        // para evitar que ele seja desativado no final.
                         upsertData.push({ 
                             listing_id, 
-                            seen_today: true, 
-                            last_sync: agora, 
-                            status: 'ativo' 
+                            last_sync: inicioSincronizacao, 
+                            status: 'ativo',
+                            xml_provider: PROVIDER_NAME
                         });
                     }
                 }
@@ -279,16 +277,18 @@ async function runImport() {
             }
         }
 
-        // 5. Inativar Imóveis Ausentes
+        // 4. Inativar Imóveis Ausentes
+        // Regra: Se o imóvel é deste provedor, está ativo, mas o 'last_sync' é ANTERIOR ao início desta rodada,
+        // significa que ele não estava no XML processado.
         console.log('🗑️ Inativando imóveis que não constam mais no XML...');
         const { error: errorInativar, count: desativadosCount } = await supabase
             .from(TABELA_CACHE)
             .update({ 
                 status: 'inativo', 
-                data_ultima_alteracao: agora 
+                data_ultima_alteracao: inicioSincronizacao 
             })
             .eq('xml_provider', PROVIDER_NAME)
-            .eq('seen_today', false)
+            .lt('last_sync', inicioSincronizacao) 
             .eq('status', 'ativo')
             .select('listing_id', { count: 'exact' });
         
