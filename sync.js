@@ -124,6 +124,7 @@ function gerarHash(d) {
     String(d.cidade || '').toUpperCase(),
     String(d.bairro || ''),
     String(d.endereco || ''),
+    String(d.numero || ''), // Adicionado número aqui
     String(d.uf || ''),
     String(d.latitude || ''),
     String(d.longitude || ''),
@@ -183,6 +184,9 @@ function parsearImovel(item) {
   const latitude = (lat && lat !== '' && lat !== '0') ? lat : null;
   const longitude = (lng && lng !== '' && lng !== '0') ? lng : null;
 
+  // Captura o StreetNumber (número da rua)
+  const numero = lerInteiro(location.StreetNumber); // Novo campo
+
   const dados = {
     listing_id,
     titulo: lerTexto(item.Title),
@@ -192,6 +196,7 @@ function parsearImovel(item) {
     bairro: lerTexto(location.Neighborhood) || null,
     uf: lerTexto(location.State) || 'PR',
     endereco: lerTexto(location.Address) || null,
+    numero, // Adiciona o número aqui
     latitude,
     longitude,
     quartos: lerInteiro(details.Bedrooms),
