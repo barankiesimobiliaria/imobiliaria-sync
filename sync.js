@@ -1,19 +1,6 @@
 /**
  * SINCRONIZAÇÃO DE IMÓVEIS XML -> SUPABASE
- * Versão: 9.0 (Reescrita completa)
- * 
- * REGRAS:
- *   1. Está no XML e NÃO está no banco        → INSERT (novo)
- *   2. Está no XML e está INATIVO no banco     → UPDATE reativar + atualizar dados
- *   3. NÃO está no XML e está ATIVO no banco   → UPDATE inativar
- *   4. Está no XML e está ATIVO no banco        → compara hash, se mudou → UPDATE dados
- * 
- * CORREÇÕES vs v8.1:
- *   - NUNCA faz upsert parcial (não destrói dados)
- *   - Hash determinístico e consistente
- *   - Separa INSERT de UPDATE (sem upsert misto)
- *   - Inativação por SET de IDs (não por timestamp)
- *   - Apenas atualiza last_sync nos sem alteração (via UPDATE, não upsert)
+ * Versão: 9.1 (Inclusão de CEP/PostalCode)
  */
 
 require('dotenv').config();
@@ -52,7 +39,6 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 function lerTexto(campo) {
   if (campo === undefined || campo === null) return '';
   if (typeof campo === 'object') {
-    // Lida com CDATA e atributos do fast-xml-parser
     if (campo['#text'] !== undefined) return String(campo['#text']).trim();
     return '';
   }
@@ -88,7 +74,6 @@ function extrairFotos(mediaNode) {
     const url = lerTexto(m);
     if (!url || !url.startsWith('http')) continue;
     
-    // Verifica se é primary (pode vir como string ou boolean)
     const isPrimary = m['@_primary'] === 'true' || m['@_primary'] === true;
     
     if (isPrimary && !capa) {
@@ -98,7 +83,6 @@ function extrairFotos(mediaNode) {
     }
   }
 
-  // Capa sempre na primeira posição
   if (capa) fotos.unshift(capa);
   return fotos;
 }
@@ -112,8 +96,6 @@ function extrairDiferenciais(detailsNode) {
 
 // ═══════════════════════════════════════════
 // HASH DETERMINÍSTICO
-// Gera o mesmo hash se os dados forem iguais,
-// independente de tipo (string vs number)
 // ═══════════════════════════════════════════
 
 function gerarHash(d) {
@@ -123,8 +105,9 @@ function gerarHash(d) {
     String(d.finalidade || ''),
     String(d.cidade || '').toUpperCase(),
     String(d.bairro || ''),
+    String(d.cep || ''),         // <-- ADICIONADO CEP NO HASH
     String(d.endereco || ''),
-    String(d.numero || ''), // Adicionado número aqui
+    String(d.numero || ''), 
     String(d.uf || ''),
     String(d.latitude || ''),
     String(d.longitude || ''),
@@ -159,7 +142,6 @@ function parsearImovel(item) {
   const location = item.Location || {};
   const transacao = lerTexto(item.TransactionType);
 
-  // Determinar valores de venda/aluguel
   let valor_venda = 0;
   let valor_aluguel = 0;
   const pVenda = lerNumero(details.ListPrice);
@@ -180,12 +162,10 @@ function parsearImovel(item) {
   const cidade = lerTexto(location.City);
   const lat = location.Latitude ? String(location.Latitude) : null;
   const lng = location.Longitude ? String(location.Longitude) : null;
-  // Limpa lat/lng vazias
   const latitude = (lat && lat !== '' && lat !== '0') ? lat : null;
   const longitude = (lng && lng !== '' && lng !== '0') ? lng : null;
 
-  // Captura o StreetNumber (número da rua)
-  const numero = lerInteiro(location.StreetNumber); // Novo campo
+  const numero = lerInteiro(location.StreetNumber);
 
   const dados = {
     listing_id,
@@ -195,8 +175,9 @@ function parsearImovel(item) {
     cidade: cidade ? cidade.toUpperCase() : null,
     bairro: lerTexto(location.Neighborhood) || null,
     uf: lerTexto(location.State) || 'PR',
+    cep: lerTexto(location.PostalCode) || null, // <-- MAPEADO PARA A NOVA COLUNA
     endereco: lerTexto(location.Address) || null,
-    numero, // Adiciona o número aqui
+    numero, 
     latitude,
     longitude,
     quartos: lerInteiro(details.Bedrooms),
@@ -246,7 +227,6 @@ async function downloadXML() {
 
 // ═══════════════════════════════════════════
 // CARREGAR TODOS OS REGISTROS DO BANCO
-// (listing_id, data_hash, status)
 // ═══════════════════════════════════════════
 
 async function carregarBanco() {
@@ -300,7 +280,6 @@ async function inserirBatch(registros) {
 }
 
 async function atualizarBatch(registros) {
-  // Cada registro precisa ser atualizado individualmente por listing_id
   if (registros.length === 0) return;
   for (let i = 0; i < registros.length; i += BATCH_SIZE) {
     const batch = registros.slice(i, i + BATCH_SIZE);
@@ -323,7 +302,6 @@ async function atualizarBatch(registros) {
 }
 
 async function atualizarSyncBatch(listingIds, timestamp) {
-  // Apenas atualiza last_sync para quem não mudou (sem tocar nos dados!)
   if (listingIds.length === 0) return;
   for (let i = 0; i < listingIds.length; i += BATCH_SIZE) {
     const batch = listingIds.slice(i, i + BATCH_SIZE);
@@ -389,7 +367,7 @@ async function registrarLog(stats) {
 async function runSync() {
   console.log('');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('🚀 SYNC XML v9.0 — INÍCIO');
+  console.log('🚀 SYNC XML v9.1 — INÍCIO (INCLUINDO CEP)');
   console.log(`📅 ${new Date().toISOString()}`);
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
@@ -407,10 +385,8 @@ async function runSync() {
   };
 
   try {
-    // ─── 1. Carregar banco atual ───
     const banco = await carregarBanco();
 
-    // ─── 2. Baixar e parsear XML ───
     const xmlRaw = await downloadXML();
     const parser = new XMLParser({
       ignoreAttributes: false,
@@ -426,11 +402,10 @@ async function runSync() {
     stats.totalXml = listings.length;
     console.log(`📦 ${stats.totalXml} imóveis encontrados no XML.`);
 
-    // ─── 3. Processar cada imóvel do XML ───
     const idsNoXml = new Set();
-    const paraInserir = [];       // Regra 1: novos
-    const paraAtualizar = [];     // Regra 2 (reativar) e Regra 4 (dados mudaram)
-    const idsSemAlteracao = [];   // Regra 4: sem mudança, só atualiza last_sync
+    const paraInserir = [];
+    const paraAtualizar = [];
+    const idsSemAlteracao = [];
 
     for (const item of listings) {
       const imovel = parsearImovel(item);
@@ -438,14 +413,12 @@ async function runSync() {
 
       const { listing_id } = imovel;
 
-      // Evitar duplicados dentro do próprio XML
       if (idsNoXml.has(listing_id)) continue;
       idsNoXml.add(listing_id);
 
       const existente = banco.get(listing_id);
 
       if (!existente) {
-        // ═══ REGRA 1: Novo imóvel ═══
         stats.novos++;
         paraInserir.push({
           ...imovel,
@@ -454,7 +427,6 @@ async function runSync() {
           data_ultima_alteracao: agora
         });
       } else if (existente.status !== 'ativo') {
-        // ═══ REGRA 2: Reativar ═══
         stats.reativados++;
         paraAtualizar.push({
           listing_id,
@@ -464,7 +436,6 @@ async function runSync() {
           data_ultima_alteracao: agora
         });
       } else if (existente.hash !== imovel.data_hash) {
-        // ═══ REGRA 4a: Ativo mas dados mudaram ═══
         stats.atualizados++;
         paraAtualizar.push({
           listing_id,
@@ -474,14 +445,11 @@ async function runSync() {
           data_ultima_alteracao: agora
         });
       } else {
-        // ═══ REGRA 4b: Ativo e sem alteração ═══
         stats.semAlteracao++;
         idsSemAlteracao.push(listing_id);
       }
     }
 
-    // ─── REGRA 3: Inativar ausentes ───
-    // Quem está ativo no banco mas NÃO apareceu no XML
     const idsParaInativar = [];
     for (const [listing_id, dados] of banco.entries()) {
       if (dados.status === 'ativo' && !idsNoXml.has(listing_id)) {
@@ -490,7 +458,6 @@ async function runSync() {
     }
     stats.inativados = idsParaInativar.length;
 
-    // ─── 4. Executar operações no banco ───
     console.log('');
     console.log('📊 Resumo das operações:');
     console.log(`   🆕 Novos para inserir:    ${stats.novos}`);
@@ -500,40 +467,35 @@ async function runSync() {
     console.log(`   ✅ Sem alteração:          ${stats.semAlteracao}`);
     console.log('');
 
-    // 4a. INSERIR novos
     if (paraInserir.length > 0) {
       console.log(`🆕 Inserindo ${paraInserir.length} novos...`);
       await inserirBatch(paraInserir);
       console.log('   ✅ Inserção concluída.');
     }
 
-    // 4b. ATUALIZAR (mudanças + reativações)
     if (paraAtualizar.length > 0) {
       console.log(`🔄 Atualizando ${paraAtualizar.length} registros...`);
       await atualizarBatch(paraAtualizar);
       console.log('   ✅ Atualização concluída.');
     }
 
-    // 4c. ATUALIZAR last_sync dos sem alteração
     if (idsSemAlteracao.length > 0) {
       console.log(`⏱️  Atualizando last_sync de ${idsSemAlteracao.length} sem alteração...`);
       await atualizarSyncBatch(idsSemAlteracao, agora);
       console.log('   ✅ last_sync atualizado.');
     }
 
-    // 4d. INATIVAR ausentes
     if (idsParaInativar.length > 0) {
       console.log(`🗑️  Inativando ${idsParaInativar.length} ausentes...`);
       await inativarAusentes(idsParaInativar, agora);
       console.log('   ✅ Inativação concluída.');
     }
 
-    // ─── 5. Resultado final ───
     console.log('');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log('✅ SINCRONIZAÇÃO CONCLUÍDA COM SUCESSO!');
     console.log(`   📦 Total XML:       ${stats.totalXml}`);
-    console.log(`   🆕 Novos:           ${stats.novos}`);
+    console.log(`   🆕 Novos:            ${stats.novos}`);
     console.log(`   🔄 Atualizados:     ${stats.atualizados}`);
     console.log(`   ♻️  Reativados:      ${stats.reativados}`);
     console.log(`   🗑️  Inativados:      ${stats.inativados}`);
