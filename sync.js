@@ -1,6 +1,6 @@
 /**
  * SINCRONIZAÇÃO DE IMÓVEIS XML -> SUPABASE
- * Versão: 9.1 (Inclusão de CEP/PostalCode)
+ * Versão: 9.2 (Inclusão de CEP + Dados do Angariador)
  */
 
 require('dotenv').config();
@@ -105,7 +105,7 @@ function gerarHash(d) {
     String(d.finalidade || ''),
     String(d.cidade || '').toUpperCase(),
     String(d.bairro || ''),
-    String(d.cep || ''),         // <-- ADICIONADO CEP NO HASH
+    String(d.cep || ''),         // CEP incluso
     String(d.endereco || ''),
     String(d.numero || ''), 
     String(d.uf || ''),
@@ -122,6 +122,11 @@ function gerarHash(d) {
     Number(d.valor_condominio || 0).toFixed(2),
     Number(d.iptu || 0).toFixed(2),
     String(d.descricao || '').substring(0, 500),
+    // --- Novos campos do Angariador no Hash ---
+    String(d.angariador_nome || ''),
+    String(d.angariador_email || ''),
+    String(d.angariador_telefone || ''),
+    // ------------------------------------------
     JSON.stringify(d.fotos_urls || []),
     JSON.stringify(d.diferenciais || [])
   ];
@@ -140,6 +145,10 @@ function parsearImovel(item) {
 
   const details = item.Details || {};
   const location = item.Location || {};
+  
+  // Tenta pegar de ContactInfo ou Publisher (dependendo do padrão do XML)
+  const contact = item.ContactInfo || item.Publisher || {}; 
+
   const transacao = lerTexto(item.TransactionType);
 
   let valor_venda = 0;
@@ -175,7 +184,7 @@ function parsearImovel(item) {
     cidade: cidade ? cidade.toUpperCase() : null,
     bairro: lerTexto(location.Neighborhood) || null,
     uf: lerTexto(location.State) || 'PR',
-    cep: lerTexto(location.PostalCode) || null, // <-- MAPEADO PARA A NOVA COLUNA
+    cep: lerTexto(location.PostalCode) || null,
     endereco: lerTexto(location.Address) || null,
     numero, 
     latitude,
@@ -191,6 +200,13 @@ function parsearImovel(item) {
     valor_condominio: lerNumero(details.PropertyAdministrationFee),
     iptu: lerNumero(details.YearlyTax) || lerNumero(details.MonthlyTax),
     descricao: lerTexto(details.Description) || null,
+    
+    // --- Campos do Angariador ---
+    angariador_nome: lerTexto(contact.Name) || null,
+    angariador_email: lerTexto(contact.Email) || null,
+    angariador_telefone: lerTexto(contact.Telephone) || null,
+    // ----------------------------
+    
     fotos_urls: fotos,
     diferenciais,
     xml_provider: PROVIDER_NAME
@@ -367,7 +383,7 @@ async function registrarLog(stats) {
 async function runSync() {
   console.log('');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('🚀 SYNC XML v9.1 — INÍCIO (INCLUINDO CEP)');
+  console.log('🚀 SYNC XML v9.2 — INÍCIO (C/ ANGARIADOR)');
   console.log(`📅 ${new Date().toISOString()}`);
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
