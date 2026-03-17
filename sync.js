@@ -486,7 +486,8 @@ async function runSync() {
     }
 
     // IDs no banco (ativos) que NÃO apareceram no XML → inativar
-for (const [listing_id, dados] of banco.entries()) {
+    const idsParaInativar = [];
+    for (const [listing_id, dados] of banco.entries()) {
   if (dados.status === 'ativo' && !idsNoXml.has(listing_id)) {
     idsParaInativar.push(listing_id);
   }
