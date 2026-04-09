@@ -1,6 +1,6 @@
 /**
  * SINCRONIZAÇÃO DE IMÓVEIS XML -> SUPABASE
- * Versão: 11.0 (CORREÇÃO DE MATCH DE IDs E INATIVAÇÃO PRECISA)
+ * Versão: 10.0 (SOLUÇÃO DEFINITIVA PARA INATIVAÇÃO)
  */
 
 require('dotenv').config();
@@ -60,11 +60,11 @@ function lerInteiro(campo) {
 }
 
 /**
- * 🔧 NORMALIZAÇÃO DE COMPARAÇÃO: 
- * Usada APENAS para chaves de Map internos para evitar duplicatas e erros de case.
+ * 🔧 NORMALIZAÇÃO CRÍTICA: 
+ * Garante que o ID seja tratado da mesma forma em todas as etapas (XML e Banco).
  */
-function normalizarParaChave(id) {
-  return String(id || '').trim().toLowerCase();
+function normalizarListingId(id) {
+  return String(id || '').trim(); // Removido .toLowerCase() para evitar conflitos se o banco for case-sensitive, mas mantido trim
 }
 
 function extrairFotos(mediaNode) {
@@ -142,7 +142,8 @@ function gerarHash(d) {
 // ═══════════════════════════════════════════
 
 function parsearImovel(item) {
-  const listing_id = lerTexto(item.ListingID);
+  const rawId = lerTexto(item.ListingID);
+  const listing_id = normalizarListingId(rawId);
   
   if (!listing_id) return null;
 
@@ -231,8 +232,8 @@ async function carregarBanco() {
     if (!data || data.length === 0) break;
 
     for (const row of data) {
-      // Chave normalizada para busca rápida, mas guarda o ID original para updates
-      mapa.set(normalizarParaChave(row.listing_id), {
+      // Importante: usar o listing_id original do banco para garantir o match no update posterior
+      mapa.set(normalizarListingId(row.listing_id), {
         originalId: row.listing_id,
         hash: row.data_hash || '',
         status: row.status || 'ativo'
@@ -261,6 +262,7 @@ async function processarOperacoes(paraInserir, paraAtualizar, paraInativar, agor
   // 2. ATUALIZAR EXISTENTES (INCLUI REATIVADOS)
   if (paraAtualizar.length > 0) {
     console.log(`🔄 Atualizando/Reativando ${paraAtualizar.length} imóveis...`);
+    // Updates individuais ou em batches pequenos para evitar timeout/erros de concorrência
     for (const imovel of paraAtualizar) {
       const { listing_id, ...dados } = imovel;
       const { error } = await supabase
@@ -272,11 +274,13 @@ async function processarOperacoes(paraInserir, paraAtualizar, paraInativar, agor
     }
   }
 
-  // 3. INATIVAR AUSENTES
+  // 3. INATIVAR AUSENTES (A CORREÇÃO)
   if (paraInativar.length > 0) {
     console.log(`🗑️  Inativando ${paraInativar.length} imóveis ausentes no XML...`);
     for (let i = 0; i < paraInativar.length; i += BATCH_SIZE) {
       const batch = paraInativar.slice(i, i + BATCH_SIZE);
+      
+      // TENTATIVA 1: Filtro .in()
       const { error } = await supabase
         .from(TABELA_CACHE)
         .update({ 
@@ -288,12 +292,18 @@ async function processarOperacoes(paraInserir, paraAtualizar, paraInativar, agor
         .in('listing_id', batch);
 
       if (error) {
-        console.error(`⚠️ Erro no batch de inativação. Tentando individualmente...`);
+        console.error(`⚠️ Erro no batch update de inativação: ${error.message}. Tentando individualmente...`);
+        // Fallback: TENTATIVA 2: Individual
         for (const id of batch) {
-          await supabase.from(TABELA_CACHE).update({ status: 'inativo', data_ultima_alteracao: agora }).eq('listing_id', id).eq('xml_provider', PROVIDER_NAME);
+          await supabase
+            .from(TABELA_CACHE)
+            .update({ status: 'inativo', data_ultima_alteracao: agora })
+            .eq('listing_id', id)
+            .eq('xml_provider', PROVIDER_NAME);
         }
       }
     }
+    console.log('   ✅ Processo de inativação concluído.');
   }
 }
 
@@ -302,14 +312,16 @@ async function processarOperacoes(paraInserir, paraAtualizar, paraInativar, agor
 // ═══════════════════════════════════════════
 
 async function runSync() {
-  console.log('\n🚀 INICIANDO SINCRONIZAÇÃO DEFINITIVA v11.0');
+  console.log('\n🚀 INICIANDO SINCRONIZAÇÃO OTIMIZADA v10.0');
   const agora = new Date().toISOString();
   
-  const stats = { totalXml: 0, novos: 0, atualizados: 0, reativados: 0, inativados: 0, semAlteracao: 0 };
+  const stats = { totalXml: 0, novos: 0, atualizados: 0, reativados: 0, inativados: 0, semAlteracao: 0, erro: false };
 
   try {
+    // 1. Carregar Banco
     const banco = await carregarBanco();
 
+    // 2. Baixar e Parsear XML
     console.log('📥 Baixando XML...');
     const response = await axios.get(XML_URL, { timeout: AXIOS_TIMEOUT });
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', trimValues: true });
@@ -319,32 +331,32 @@ async function runSync() {
     
     console.log(`📦 ${listings.length} imóveis no XML.`);
 
-    // 🔧 CRÍTICO: Conjunto de IDs normalizados para comparação SEGURA
-    const idsNormalizadosNoXml = new Set();
+    const idsNoXml = new Set();
     const paraInserir = [];
     const paraAtualizar = [];
     const idsSemAlteracao = [];
 
+    // 3. Comparar XML -> Banco
     for (const item of listings) {
       const imovel = parsearImovel(item);
       if (!imovel) continue;
 
-      const idOriginal = imovel.listing_id;
-      const idChave = normalizarParaChave(idOriginal);
-      
-      idsNormalizadosNoXml.add(idChave);
+      const id = imovel.listing_id;
+      idsNoXml.add(id);
       stats.totalXml++;
 
-      const existente = banco.get(idChave);
+      const existente = banco.get(id);
 
       if (!existente) {
         stats.novos++;
         paraInserir.push({ ...imovel, status: 'ativo', last_sync: agora, data_ultima_alteracao: agora });
       } else {
         const mudou = existente.hash !== imovel.data_hash || existente.status !== 'ativo';
+        
         if (mudou) {
           if (existente.status !== 'ativo') stats.reativados++;
           else stats.atualizados++;
+          
           paraAtualizar.push({ ...imovel, status: 'ativo', last_sync: agora, data_ultima_alteracao: agora });
         } else {
           stats.semAlteracao++;
@@ -353,17 +365,19 @@ async function runSync() {
       }
     }
 
-    // 🔧 CRÍTICO: Identificar o que INATIVAR usando a mesma normalização
+    // 4. Identificar o que INATIVAR (Banco -> XML)
     const idsParaInativar = [];
-    for (const [idChave, dados] of banco.entries()) {
-      if (dados.status === 'ativo' && !idsNormalizadosNoXml.has(idChave)) {
+    for (const [id, dados] of banco.entries()) {
+      if (dados.status === 'ativo' && !idsNoXml.has(id)) {
         idsParaInativar.push(dados.originalId);
       }
     }
     stats.inativados = idsParaInativar.length;
 
+    // 5. Executar as operações
     await processarOperacoes(paraInserir, paraAtualizar, idsParaInativar, agora);
 
+    // 6. Atualizar last_sync dos que não mudaram
     if (idsSemAlteracao.length > 0) {
       console.log(`⏱️  Sincronizando timestamp de ${idsSemAlteracao.length} imóveis...`);
       for (let i = 0; i < idsSemAlteracao.length; i += BATCH_SIZE) {
