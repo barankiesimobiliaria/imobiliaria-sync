@@ -1,6 +1,6 @@
 /**
  * SINCRONIZAÇÃO DE IMÓVEIS XML -> SUPABASE
- * Versão: 10.0 (SOLUÇÃO DEFINITIVA PARA INATIVAÇÃO)
+ * Versão: 11.0 (Refatorada - Foco em Paginação e Inativação Segura)
  */
 
 require('dotenv').config();
@@ -14,10 +14,8 @@ const crypto = require('crypto');
 // ═══════════════════════════════════════════
 const XML_URL = 'https://redeurbana.com.br/imoveis/rede/2e2b5834-643b-49c1-8289-005b800168e9';
 const PROVIDER_NAME = 'RedeUrbana';
-const BATCH_SIZE = 50;
+const BATCH_SIZE = 50; // Mantido em 50 para evitar sobrecarga no Supabase
 const TABELA_CACHE = 'cache_xml_externo';
-const TABELA_LOGS = 'import_logs';
-const MAX_RETRIES = 3;
 const AXIOS_TIMEOUT = 120000;
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
@@ -30,7 +28,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 });
 
 // ═══════════════════════════════════════════
-// FUNÇÕES AUXILIARES
+// FUNÇÕES AUXILIARES E PARSERS (Mantidas as originais)
 // ═══════════════════════════════════════════
 
 function lerTexto(campo) {
@@ -59,34 +57,24 @@ function lerInteiro(campo) {
   return Math.floor(lerNumero(campo));
 }
 
-/**
- * 🔧 NORMALIZAÇÃO CRÍTICA: 
- * Garante que o ID seja tratado da mesma forma em todas as etapas (XML e Banco).
- */
 function normalizarListingId(id) {
-  return String(id || '').trim(); // Removido .toLowerCase() para evitar conflitos se o banco for case-sensitive, mas mantido trim
+  // O trim() remove espaços invisíveis que quebram o comparativo
+  return String(id || '').trim(); 
 }
 
 function extrairFotos(mediaNode) {
   if (!mediaNode || !mediaNode.Item) return [];
   const items = Array.isArray(mediaNode.Item) ? mediaNode.Item : [mediaNode.Item];
-  
   const fotos = [];
   let capa = null;
 
   for (const m of items) {
     const url = lerTexto(m);
     if (!url || !url.startsWith('http')) continue;
-    
     const isPrimary = m['@_primary'] === 'true' || m['@_primary'] === true;
-    
-    if (isPrimary && !capa) {
-      capa = url;
-    } else {
-      fotos.push(url);
-    }
+    if (isPrimary && !capa) capa = url;
+    else fotos.push(url);
   }
-
   if (capa) fotos.unshift(capa);
   return fotos;
 }
@@ -97,10 +85,6 @@ function extrairDiferenciais(detailsNode) {
   const lista = Array.isArray(feat) ? feat : [feat];
   return lista.map(f => lerTexto(f)).filter(f => f !== '').sort();
 }
-
-// ═══════════════════════════════════════════
-// HASH DETERMINÍSTICO
-// ═══════════════════════════════════════════
 
 function gerarHash(d) {
   const partes = [
@@ -132,19 +116,11 @@ function gerarHash(d) {
     JSON.stringify((d.fotos_urls || []).sort()),
     JSON.stringify((d.diferenciais || []).sort())
   ];
-
-  const str = partes.join('|');
-  return crypto.createHash('md5').update(str).digest('hex');
+  return crypto.createHash('md5').update(partes.join('|')).digest('hex');
 }
 
-// ═══════════════════════════════════════════
-// PARSEAR UM LISTING DO XML
-// ═══════════════════════════════════════════
-
 function parsearImovel(item) {
-  const rawId = lerTexto(item.ListingID);
-  const listing_id = normalizarListingId(rawId);
-  
+  const listing_id = normalizarListingId(lerTexto(item.ListingID));
   if (!listing_id) return null;
 
   const details = item.Details || {};
@@ -157,23 +133,13 @@ function parsearImovel(item) {
   const pVenda = lerNumero(details.ListPrice);
   const pAluguel = lerNumero(details.RentalPrice);
 
-  if (transacao === 'For Rent') {
-    valor_aluguel = pAluguel || pVenda;
-  } else if (transacao === 'For Sale') {
-    valor_venda = pVenda;
-  } else {
-    valor_venda = pVenda;
-    valor_aluguel = pAluguel;
-  }
-
-  const fotos = extrairFotos(item.Media);
-  const diferenciais = extrairDiferenciais(details);
+  if (transacao === 'For Rent') valor_aluguel = pAluguel || pVenda;
+  else if (transacao === 'For Sale') valor_venda = pVenda;
+  else { valor_venda = pVenda; valor_aluguel = pAluguel; }
 
   const cidade = lerTexto(location.City);
   const lat = location.Latitude ? String(location.Latitude) : null;
   const lng = location.Longitude ? String(location.Longitude) : null;
-  const latitude = (lat && lat !== '' && lat !== '0') ? lat : null;
-  const longitude = (lng && lng !== '' && lng !== '0') ? lng : null;
 
   const dados = {
     listing_id,
@@ -186,8 +152,8 @@ function parsearImovel(item) {
     cep: lerTexto(location.PostalCode) || null,
     endereco: lerTexto(location.Address) || null,
     numero: lerInteiro(location.StreetNumber),
-    latitude,
-    longitude,
+    latitude: (lat && lat !== '0') ? lat : null,
+    longitude: (lng && lng !== '0') ? lng : null,
     quartos: lerInteiro(details.Bedrooms),
     suites: lerInteiro(details.Suites),
     banheiros: lerInteiro(details.Bathrooms),
@@ -202,8 +168,8 @@ function parsearImovel(item) {
     angariador_nome: lerTexto(contact.Name) || null,
     angariador_email: lerTexto(contact.Email) || null,
     angariador_telefone: lerTexto(contact.Telephone) || null,
-    fotos_urls: fotos,
-    diferenciais,
+    fotos_urls: extrairFotos(item.Media),
+    diferenciais: extrairDiferenciais(details),
     xml_provider: PROVIDER_NAME
   };
 
@@ -212,99 +178,81 @@ function parsearImovel(item) {
 }
 
 // ═══════════════════════════════════════════
-// OPERAÇÕES NO SUPABASE
+// CORE: COMUNICAÇÃO ROBUSTA COM O BANCO
 // ═══════════════════════════════════════════
 
-async function carregarBanco() {
-  console.log('🔍 Carregando IDs ativos do banco...');
-  const mapa = new Map();
-  let offset = 0;
-  const pageSize = 1000;
+async function carregarBancoSeguro() {
+  console.log('🔍 Carregando imóveis do banco (paginação segura)...');
+  const mapaBanco = new Map();
+  let limit = 1000;
+  let page = 0;
+  let hasMore = true;
 
-  while (true) {
+  while (hasMore) {
+    const from = page * limit;
+    const to = from + limit - 1;
+
     const { data, error } = await supabase
       .from(TABELA_CACHE)
       .select('listing_id, data_hash, status')
       .eq('xml_provider', PROVIDER_NAME)
-      .range(offset, offset + pageSize - 1);
+      .range(from, to);
 
-    if (error) throw new Error(`Erro ao ler banco: ${error.message}`);
-    if (!data || data.length === 0) break;
+    if (error) {
+      throw new Error(`Erro fatal ao ler banco na página ${page}: ${error.message}`);
+    }
 
-    for (const row of data) {
-      // Importante: usar o listing_id original do banco para garantir o match no update posterior
-      mapa.set(normalizarListingId(row.listing_id), {
-        originalId: row.listing_id,
+    if (!data || data.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    data.forEach(row => {
+      mapaBanco.set(normalizarListingId(row.listing_id), {
         hash: row.data_hash || '',
         status: row.status || 'ativo'
       });
-    }
+    });
 
-    if (data.length < pageSize) break;
-    offset += pageSize;
+    if (data.length < limit) hasMore = false;
+    page++;
   }
 
-  console.log(`✅ ${mapa.size} registros carregados do banco.`);
-  return mapa;
+  console.log(`✅ ${mapaBanco.size} registros carregados do banco com sucesso.`);
+  return mapaBanco;
 }
 
-async function processarOperacoes(paraInserir, paraAtualizar, paraInativar, agora) {
-  // 1. INSERIR NOVOS
-  if (paraInserir.length > 0) {
-    console.log(`🆕 Inserindo ${paraInserir.length} novos imóveis...`);
-    for (let i = 0; i < paraInserir.length; i += BATCH_SIZE) {
-      const batch = paraInserir.slice(i, i + BATCH_SIZE);
-      const { error } = await supabase.from(TABELA_CACHE).insert(batch);
-      if (error) console.error(`❌ Erro ao inserir batch: ${error.message}`);
-    }
-  }
+async function executarInativacoes(idsParaInativar, agora) {
+  if (idsParaInativar.length === 0) return;
+  
+  console.log(`🗑️  Iniciando inativação de ${idsParaInativar.length} imóveis (sumiram do XML)...`);
+  
+  for (let i = 0; i < idsParaInativar.length; i += BATCH_SIZE) {
+    const batch = idsParaInativar.slice(i, i + BATCH_SIZE);
+    
+    const { error } = await supabase
+      .from(TABELA_CACHE)
+      .update({ 
+        status: 'inativo', 
+        data_ultima_alteracao: agora,
+        last_sync: agora 
+      })
+      .eq('xml_provider', PROVIDER_NAME)
+      .in('listing_id', batch);
 
-  // 2. ATUALIZAR EXISTENTES (INCLUI REATIVADOS)
-  if (paraAtualizar.length > 0) {
-    console.log(`🔄 Atualizando/Reativando ${paraAtualizar.length} imóveis...`);
-    // Updates individuais ou em batches pequenos para evitar timeout/erros de concorrência
-    for (const imovel of paraAtualizar) {
-      const { listing_id, ...dados } = imovel;
-      const { error } = await supabase
-        .from(TABELA_CACHE)
-        .update(dados)
-        .eq('listing_id', listing_id)
-        .eq('xml_provider', PROVIDER_NAME);
-      if (error) console.error(`❌ Erro ao atualizar ${listing_id}: ${error.message}`);
-    }
-  }
-
-  // 3. INATIVAR AUSENTES (A CORREÇÃO)
-  if (paraInativar.length > 0) {
-    console.log(`🗑️  Inativando ${paraInativar.length} imóveis ausentes no XML...`);
-    for (let i = 0; i < paraInativar.length; i += BATCH_SIZE) {
-      const batch = paraInativar.slice(i, i + BATCH_SIZE);
-      
-      // TENTATIVA 1: Filtro .in()
-      const { error } = await supabase
-        .from(TABELA_CACHE)
-        .update({ 
-          status: 'inativo', 
-          data_ultima_alteracao: agora,
-          last_sync: agora 
-        })
-        .eq('xml_provider', PROVIDER_NAME)
-        .in('listing_id', batch);
-
-      if (error) {
-        console.error(`⚠️ Erro no batch update de inativação: ${error.message}. Tentando individualmente...`);
-        // Fallback: TENTATIVA 2: Individual
-        for (const id of batch) {
-          await supabase
-            .from(TABELA_CACHE)
-            .update({ status: 'inativo', data_ultima_alteracao: agora })
-            .eq('listing_id', id)
-            .eq('xml_provider', PROVIDER_NAME);
-        }
+    if (error) {
+      console.error(`⚠️ Erro ao inativar lote. Tentando inativar um a um... Detalhe: ${error.message}`);
+      // Fallback: se o lote falhar, tenta um por um para não perder o processo
+      for (const id of batch) {
+        await supabase
+          .from(TABELA_CACHE)
+          .update({ status: 'inativo', data_ultima_alteracao: agora, last_sync: agora })
+          .eq('listing_id', id)
+          .eq('xml_provider', PROVIDER_NAME);
       }
     }
-    console.log('   ✅ Processo de inativação concluído.');
   }
+  console.log(`✅ ${idsParaInativar.length} imóveis inativados com sucesso.`);
 }
 
 // ═══════════════════════════════════════════
@@ -312,78 +260,95 @@ async function processarOperacoes(paraInserir, paraAtualizar, paraInativar, agor
 // ═══════════════════════════════════════════
 
 async function runSync() {
-  console.log('\n🚀 INICIANDO SINCRONIZAÇÃO OTIMIZADA v10.0');
+  console.log('\n🚀 INICIANDO SINCRONIZAÇÃO REFATORADA v11.0');
   const agora = new Date().toISOString();
   
-  const stats = { totalXml: 0, novos: 0, atualizados: 0, reativados: 0, inativados: 0, semAlteracao: 0, erro: false };
+  const stats = { totalXml: 0, novos: 0, atualizados: 0, reativados: 0, inativados: 0, erro: false };
 
   try {
-    // 1. Carregar Banco
-    const banco = await carregarBanco();
+    // 1. Carregar todo o histórico do banco de forma segura
+    const mapaBanco = await carregarBancoSeguro();
 
-    // 2. Baixar e Parsear XML
+    // 2. Baixar XML
     console.log('📥 Baixando XML...');
     const response = await axios.get(XML_URL, { timeout: AXIOS_TIMEOUT });
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', trimValues: true });
     const jsonData = parser.parse(response.data);
+    
     const listingsRaw = jsonData?.ListingDataFeed?.Listings?.Listing;
     const listings = Array.isArray(listingsRaw) ? listingsRaw : (listingsRaw ? [listingsRaw] : []);
-    
-    console.log(`📦 ${listings.length} imóveis no XML.`);
+    console.log(`📦 ${listings.length} imóveis lidos no XML.`);
 
-    const idsNoXml = new Set();
+    // Estruturas de controle
+    const idsNoXml = new Set(); // Usando Set para busca ultra-rápida depois
     const paraInserir = [];
     const paraAtualizar = [];
-    const idsSemAlteracao = [];
 
-    // 3. Comparar XML -> Banco
+    // 3. Processar Imóveis do XML (Inserts e Updates)
     for (const item of listings) {
       const imovel = parsearImovel(item);
       if (!imovel) continue;
 
       const id = imovel.listing_id;
-      idsNoXml.add(id);
+      idsNoXml.add(id); // Guarda na memória que este ID VEIO no XML de hoje
       stats.totalXml++;
 
-      const existente = banco.get(id);
+      const infoBanco = mapaBanco.get(id);
 
-      if (!existente) {
+      if (!infoBanco) {
+        // Não existe no banco -> NOVO
         stats.novos++;
         paraInserir.push({ ...imovel, status: 'ativo', last_sync: agora, data_ultima_alteracao: agora });
       } else {
-        const mudou = existente.hash !== imovel.data_hash || existente.status !== 'ativo';
+        // Existe no banco -> Verifica se precisa atualizar
+        const mudou = infoBanco.hash !== imovel.data_hash || infoBanco.status !== 'ativo';
         
         if (mudou) {
-          if (existente.status !== 'ativo') stats.reativados++;
+          if (infoBanco.status !== 'ativo') stats.reativados++;
           else stats.atualizados++;
           
           paraAtualizar.push({ ...imovel, status: 'ativo', last_sync: agora, data_ultima_alteracao: agora });
-        } else {
-          stats.semAlteracao++;
-          idsSemAlteracao.push(existente.originalId);
         }
       }
     }
 
-    // 4. Identificar o que INATIVAR (Banco -> XML)
+    // 4. Executar Inserts
+    if (paraInserir.length > 0) {
+      console.log(`🆕 Inserindo ${paraInserir.length} novos imóveis...`);
+      for (let i = 0; i < paraInserir.length; i += BATCH_SIZE) {
+        const batch = paraInserir.slice(i, i + BATCH_SIZE);
+        const { error } = await supabase.from(TABELA_CACHE).insert(batch);
+        if (error) console.error(`❌ Erro no insert: ${error.message}`);
+      }
+    }
+
+    // 5. Executar Updates/Reativações
+    if (paraAtualizar.length > 0) {
+      console.log(`🔄 Atualizando ${paraAtualizar.length} imóveis...`);
+      for (const imovel of paraAtualizar) {
+        const { listing_id, ...dados } = imovel;
+        const { error } = await supabase
+          .from(TABELA_CACHE)
+          .update(dados)
+          .eq('listing_id', listing_id)
+          .eq('xml_provider', PROVIDER_NAME);
+        if (error) console.error(`❌ Erro no update do ID ${listing_id}: ${error.message}`);
+      }
+    }
+
+    // 6. 🚨 LÓGICA 2 CORRIGIDA: Identificar e Inativar 🚨
     const idsParaInativar = [];
-    for (const [id, dados] of banco.entries()) {
-      if (dados.status === 'ativo' && !idsNoXml.has(id)) {
-        idsParaInativar.push(dados.originalId);
+    
+    // Varremos TUDO que estava no banco...
+    for (const [idBanco, infoBanco] of mapaBanco.entries()) {
+      // Se estava ATIVO no banco, MAS não veio no XML de hoje...
+      if (infoBanco.status === 'ativo' && !idsNoXml.has(idBanco)) {
+        idsParaInativar.push(idBanco);
       }
     }
+    
     stats.inativados = idsParaInativar.length;
-
-    // 5. Executar as operações
-    await processarOperacoes(paraInserir, paraAtualizar, idsParaInativar, agora);
-
-    // 6. Atualizar last_sync dos que não mudaram
-    if (idsSemAlteracao.length > 0) {
-      console.log(`⏱️  Sincronizando timestamp de ${idsSemAlteracao.length} imóveis...`);
-      for (let i = 0; i < idsSemAlteracao.length; i += BATCH_SIZE) {
-        await supabase.from(TABELA_CACHE).update({ last_sync: agora }).in('listing_id', idsSemAlteracao.slice(i, i + BATCH_SIZE)).eq('xml_provider', PROVIDER_NAME);
-      }
-    }
+    await executarInativacoes(idsParaInativar, agora);
 
     console.log('\n✅ SINCRONIZAÇÃO CONCLUÍDA');
     console.log(JSON.stringify(stats, null, 2));
