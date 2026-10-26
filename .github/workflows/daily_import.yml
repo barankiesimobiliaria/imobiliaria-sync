@@ -9,7 +9,7 @@ on:
     - cron: '0 16 * * *'
 
     # Teste às 15:45 Brasília (18:45 UTC)
-    - cron: '45 18 * * *'
+    - cron: '0 20 * * *'
 
   # Permite execução manual
   workflow_dispatch:
