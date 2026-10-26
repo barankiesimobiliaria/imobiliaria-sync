@@ -4,10 +4,13 @@ on:
   schedule:
     # 06:00 Brasília (09:00 UTC)
     - cron: '0 9 * * *'
-    
+
     # 13:00 Brasília (16:00 UTC)
     - cron: '0 16 * * *'
-    
+
+    # Teste às 15:45 Brasília (18:45 UTC)
+    - cron: '45 18 * * *'
+
   # Permite execução manual
   workflow_dispatch:
 
@@ -17,6 +20,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
       - name: Baixar código
         uses: actions/checkout@v4
@@ -35,7 +39,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
-      - name: Manter repositório ativo (Evitar pausa de 60 dias)
+      - name: Manter repositório ativo
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
