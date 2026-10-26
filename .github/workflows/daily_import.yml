@@ -8,8 +8,8 @@ on:
     # 13:00 Brasília (16:00 UTC)
     - cron: '0 16 * * *'
 
-    # Teste às 15:45 Brasília (18:45 UTC)
-    - cron: '45 18 * * *'
+    # Teste às 16:45 Brasília (19:45 UTC)
+    - cron: '45 19 * * *'
 
   # Permite execução manual
   workflow_dispatch:
