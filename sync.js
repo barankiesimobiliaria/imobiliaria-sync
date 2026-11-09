@@ -12,7 +12,7 @@ const crypto = require('crypto');
 // ═══════════════════════════════════════════
 // CONFIGURAÇÕES
 // ═══════════════════════════════════════════
-const XML_URL = 'https://redeurbana.com.br/imoveis/rede/2e2b5834-643b-49c1-8289-005b800168e9';
+const XML_URL = 'https://b.urbana.app.br/api/v1/public/portais-xml/dc98d0ef9682e7fb6603cebcbbbd0f7b9b1e20b0.xml';
 const PROVIDER_NAME = 'RedeUrbana';
 const BATCH_SIZE = 50;
 const TABELA_CACHE = 'cache_xml_externo';
